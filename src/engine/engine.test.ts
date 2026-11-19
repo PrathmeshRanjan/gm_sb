@@ -3,7 +3,7 @@ import type { LineString, Polygon } from 'geojson';
 import site from '../../public/data/site.json';
 import { calculateScenario, validateGeneratedConcept } from './index';
 import { withGeos } from './geos';
-import { boundaryDistances, classify, clearance, frontLimits } from './rules';
+import { boundaryDistances, classify, clearance, DESIGN_CLEARANCE_RESERVE_M, DISTANCE_TOLERANCE, frontLimits } from './rules';
 import { box, mapArea, project, roadFrame, unproject } from './spatial';
 import type { Concept, ScenarioInput } from './types';
 
@@ -18,8 +18,23 @@ const preset: ScenarioInput = {
 };
 const frame = roadFrame(preset.plot, preset.road);
 
+function world(geometry: Polygon) {
+  return mapArea(geometry, ([x, y]) => frame.toWorld([x + frame.nearX, y + 24]));
+}
+
 function fixture(geometry: Polygon, profile: ScenarioInput['profile'] = 'house'): ScenarioInput {
-  return { ...preset, profile, plot: mapArea(geometry, ([x, y]) => frame.toWorld([x + frame.nearX, y + 24])) };
+  return { ...preset, profile, plot: world(geometry) };
+}
+
+function slabConcept(plate: Polygon, floors: number, areaM2: number): Concept {
+  return {
+    id: 'wide', name: 'Independent test mass',
+    floors: Array.from({ length: floors }, (_, i) => ({
+      floor: i + 1, baseM: i * 3.2, topM: (i + 1) * 3.2, areaM2, geometry: world(plate),
+    })),
+    gfaM2: areaM2 * floors, heightM: floors * 3.2, coveredM2: areaM2, openM2: 0, perviousM2: 0,
+    planting: null, checks: [], siteEvidence: [], rationale: '', tradeOff: '', limitingFactors: [],
+  };
 }
 
 describe('native geometry and projection', () => {
@@ -33,7 +48,8 @@ describe('native geometry and projection', () => {
     const result = await calculateScenario(input);
     expect(result.validation).toBe('valid');
     expect(result.plotAreaM2).toBeCloseTo(600, 5);
-    expect(result.envelope[0].areaM2).toBeCloseTo(468, 4);
+    const compensatedRadius = (2 + DESIGN_CLEARANCE_RESERVE_M) / Math.cos(Math.PI / 64);
+    expect(result.envelope[0].areaM2).toBeCloseTo((20 - compensatedRadius) * (30 - compensatedRadius * 2), 4);
     expect(result.concepts.length).toBeGreaterThan(0);
   });
 
@@ -115,16 +131,26 @@ describe('legal applicability and independent checks', () => {
 
   it('keeps site area invariant through width changes and applies a binding height-plane fixture', async () => {
     const original = await calculateScenario(preset);
-    const narrow = { ...preset, road: { ...preset.road, widthM: 2.5, widthSource: 'user-override' as const } };
+    const narrow = { ...preset, road: { ...preset.road, widthM: 2, widthSource: 'user-override' as const } };
     const narrowed = await calculateScenario(narrow);
     const widened = await calculateScenario({ ...preset, road: { ...preset.road, widthM: 14.7 } });
     expect(original.plotAreaM2).toBeCloseTo(828, 4);
     expect(narrowed.plotAreaM2).toBeCloseTo(original.plotAreaM2, 8);
     expect(narrowed.rules.find((check) => check.id === 'height-plane')?.controls).toBe(true);
     expect(original.rules.find((check) => check.id === 'height-plane')?.controls).toBe(false);
+    expect(narrowed.capacity!.geometricGfaUpperBoundM2).toBeLessThan(original.capacity!.geometricGfaUpperBoundM2);
+    expect(narrowed.boundExplanation?.sumM2).toBeCloseTo(narrowed.capacity!.geometricGfaUpperBoundM2);
+    const baselineSlices = original.boundExplanation!.floors;
+    const stressSlices = narrowed.boundExplanation!.floors;
+    expect(stressSlices.slice(0, -1)).toEqual(baselineSlices.slice(0, -1));
+    expect(stressSlices.at(-1)!.areaM2).toBeLessThan(baselineSlices.at(-1)!.areaM2);
+    for (const [i, tested] of narrowed.concepts.entries()) {
+      expect(tested.gfaM2).toBeCloseTo(original.concepts[i].gfaM2, 8);
+    }
     expect(widened.plotAreaM2).toBeCloseTo(original.plotAreaM2, 8);
     expect(widened.validation).toBe('road-conflict');
     expect(widened.road!.conflictM2).toBeCloseTo(45, 4);
+    expect(widened.concepts).toHaveLength(0);
   });
 
   it('returns real alternatives, sums the floors, and changes profile independently of area', async () => {
@@ -133,8 +159,15 @@ describe('legal applicability and independent checks', () => {
     const [wide, stepped] = result.concepts;
     expect(stepped.floors.length).toBeGreaterThan(wide.floors.length);
     expect(stepped.coveredM2).toBeLessThan(wide.coveredM2);
-    expect(stepped.checks.find(({ id }) => id === 'special')?.detail).toContain('exceeds 15 m');
+    expect(stepped.siteEvidence.find(({ id }) => id === 'special')?.detail).toContain('exceeds 15 m');
     expect(result.capacity).toMatchObject({ profileGfaLimitM2: 1_000, regulatoryFar: 7 });
+    expect(wide.gfaM2).toBeGreaterThan(900);
+    expect(stepped.gfaM2).toBeGreaterThan(wide.gfaM2 * 0.78);
+    expect(result.search!.bestValidatedGfaM2).toBeGreaterThanOrEqual(wide.gfaM2);
+    expect(result.search!.evaluated).toBeGreaterThan(result.search!.independentlyChecked);
+    expect(result.search!.independentlyChecked).toBeGreaterThanOrEqual(result.search!.validated);
+    expect(result.boundExplanation!.floors.reduce((total, row) => total + row.areaM2, 0)).toBeCloseTo(result.boundExplanation!.sumM2, 10);
+    expect(result.boundExplanation!.classification).toContain('Special building by height. Structural and safety review required');
     const house = await calculateScenario({ ...preset, profile: 'house' });
     expect(house.plotAreaM2).toBeCloseTo(result.plotAreaM2);
     expect(house.capacity).toMatchObject({ profileGfaLimitM2: null, profileMaxFloors: 2 });
@@ -176,19 +209,93 @@ describe('legal applicability and independent checks', () => {
     expect(result.concepts).toHaveLength(0);
   });
 
-  it('catches moved plates, roof-height violations and falsified areas without generator flags', async () => {
+  it('keeps the actual generated setbacks conservative and explains independent area rounding', async () => {
+    const developed = await calculateScenario(preset);
+    for (const concept of developed.concepts) {
+      const results = await validateGeneratedConcept(preset, concept);
+      for (const id of ['private-national', 'private-local']) {
+        const check = results.find((row) => row.id === id)!;
+        expect(check.status).toBe('pass');
+        expect(check.measurement!.actualM - check.measurement!.requiredM).toBeGreaterThanOrEqual(0.0019);
+        expect(check.measurement!.toleranceM).toBe(DISTANCE_TOLERANCE);
+      }
+      expect(results.find(({ id }) => id === 'floors')?.detail).toContain('The floor schedule rounds each row');
+      expect(results.find(({ id }) => id === 'floors')?.detail).not.toContain(' + ');
+    }
+    const v2Floor = 339.50500883445574;
+    expect(v2Floor.toFixed(2)).toBe('339.51');
+    expect((v2Floor * 2).toFixed(2)).toBe('679.01');
+  });
+
+  it('rejects the old chord-sized clearance deficit that previously passed', async () => {
+    const input = fixture(box(0, 0, 20, 30));
+    const right = 20 - 2 * Math.cos(Math.PI / 32);
+    const slab = slabConcept(box(3, 5, right, 20), 1, (right - 3) * 15);
+    const audited = await validateGeneratedConcept(input, slab);
+    const measured = audited.find((rule) => rule.id === 'private-national')!;
+    expect(measured.measurement!.actualM).toBeCloseTo(1.990369452744, 6);
+    expect(measured.status).toBe('fail');
+    expect(audited.find(({ id }) => id === 'plot')?.status).toBe('pass');
+  });
+
+  it('rejects a plate crossing a concavity or hole with every corner inside the parcel', async () => {
+    const neck: Polygon = { type: 'Polygon', coordinates: [[
+      [0, 0], [12, 0], [12, 5], [19, 5], [19, 0], [31, 0], [31, 14],
+      [19, 14], [19, 9], [12, 9], [12, 14], [0, 14], [0, 0],
+    ]] };
+    const holed = box(0, 0, 29, 32);
+    holed.coordinates.push([[8, 7], [8, 13], [13, 13], [13, 7], [8, 7]]);
+    const [acrossNeck, acrossHole] = await Promise.all([
+      validateGeneratedConcept(fixture(neck), slabConcept(box(3, 2, 28, 11), 1, 225)),
+      validateGeneratedConcept(fixture(holed), slabConcept(box(3, 4, 22, 20), 1, 304)),
+    ]);
+    expect(acrossNeck.find(({ id }) => id === 'plot')?.status).toBe('fail');
+    expect(acrossHole.find(({ id }) => id === 'plot')?.status).toBe('fail');
+  });
+
+  it('changes the setback of the same ground plate when building-wide height crosses 9 m', async () => {
+    const input = fixture(box(0, 0, 20, 32), 'multifamily');
+    const geometry = box(5, 2.4, 17.6, 27);
+    const area = 12.6 * 24.6;
+    const lower = await validateGeneratedConcept(input, slabConcept(geometry, 2, area));
+    const higher = await validateGeneratedConcept(input, slabConcept(geometry, 3, area));
+    const oldCheck = lower.find(({ id }) => id === 'private-national')!;
+    const newCheck = higher.find(({ id }) => id === 'private-national')!;
+    expect(oldCheck.measurement?.requiredM).toBe(2);
+    expect(oldCheck.status).toBe('pass');
+    expect(newCheck.measurement?.requiredM).toBe(3);
+    expect(newCheck.status).toBe('fail');
+    expect(oldCheck.measurement?.actualM).toBeCloseTo(newCheck.measurement!.actualM, 8);
+  });
+
+  it('independently rejects moved and raised plates, falsified areas, and area budget exceedance', async () => {
     const original = (await calculateScenario(preset)).concepts[0];
     expect(original).toBeDefined();
-    const mutated: Concept = {
-      ...original,
-      floors: original.floors.map((floor, index) => index === 0 ? {
-        ...floor, areaM2: floor.areaM2 + 30, topM: 200,
-        geometry: mapArea(floor.geometry, ([lon, lat]) => [lon + 0.0003, lat]),
-      } : floor),
+    const moved = { ...original, floors: original.floors.map((floor, i) => i === 0 ? {
+      ...floor, geometry: mapArea(floor.geometry, ([lon, lat]) => [lon + 0.0003, lat]),
+    } : floor) };
+    const raised = { ...original, floors: original.floors.map((floor, i) => i === original.floors.length - 1
+      ? { ...floor, topM: 200 } : floor) };
+    const wrongArea = { ...original, floors: original.floors.map((floor) => ({ ...floor, areaM2: floor.areaM2 + 10 })) };
+    const oversized = slabConcept(box(5, 5, 23, 26), 3, 378);
+    const roomy = fixture(box(0, 0, 34, 36), 'multifamily');
+    const [movedAudit, raisedAudit, wrongAreaAudit, overCapAudit] = await Promise.all([
+      validateGeneratedConcept(preset, moved),
+      validateGeneratedConcept(preset, raised),
+      validateGeneratedConcept(preset, wrongArea),
+      validateGeneratedConcept(roomy, oversized),
+    ]);
+    expect(movedAudit.find(({ id }) => id === 'plot')?.status).toBe('fail');
+    expect(raisedAudit.find(({ id }) => id === 'road-height')?.status).toBe('fail');
+    expect(wrongAreaAudit.find(({ id }) => id === 'floors')?.status).toBe('fail');
+    expect(overCapAudit.find(({ id }) => id === 'profile')?.status).toBe('fail');
+    expect(overCapAudit.find(({ id }) => id === 'far')?.status).toBe('pass');
+
+    const farBudgetInput: ScenarioInput = {
+      ...roomy, redevelopment: 'retain', retainedBuildings: [{
+        footprint: world(box(25, 25, 26, 26)), grossFloorAreaM2: 8_000,
+      }],
     };
-    const result = await validateGeneratedConcept(preset, mutated);
-    expect(result.find(({ id }) => id === 'plot')?.status).toBe('fail');
-    expect(result.find(({ id }) => id === 'road-height')?.status).toBe('fail');
-    expect(result.find(({ id }) => id === 'floors')?.status).toBe('fail');
+    expect((await validateGeneratedConcept(farBudgetInput, oversized)).find(({ id  }) => id === 'far')?.status).toBe('fail');
   });
 });

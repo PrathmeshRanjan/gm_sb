@@ -4,11 +4,10 @@ import { fromRoadReference } from './envelope';
 import type { NativeFloor } from './envelope';
 import type { NativeGeometry } from './geos';
 import {
-  ACCESSIBILITY, AREA_TOLERANCE, BANGKOK, boundaryDistances, BUILDING_ACT, classify, clearance,
-  DISTANCE_TOLERANCE, ENVIRONMENT, FAR, frontLimits, NATIONAL, OSR, PLAN, PLANTING, PROFILES, rule,
+  ACCESSIBILITY, BANGKOK, boundaryDistances, BUDGET_TOLERANCE, BUILDING_ACT, classify, clearance,
+  DISTANCE_TOLERANCE, ENVIRONMENT, FAR, frontLimits, GEOMETRY_AREA_TOLERANCE, NATIONAL, OSR, PLAN, PLANTING, PROFILES, rule,
 } from './rules';
 import type { RoadLimit } from './rules';
-import { extent, points } from './spatial';
 import type { RuleResult } from './types';
 
 const square = (area: number) => `${area.toFixed(2)} m²`;
@@ -53,7 +52,8 @@ export function checkConcept(
   const perimeterDistance = clearance(input.profile, height, gfa);
   const fronts = frontLimits(frame.widthM, floors.length, height, gfa);
   const profile = PROFILES[input.profile];
-  const coverage = floors.slice(1).reduce((combined, floor) => scope.union(combined, floor.geometry), floors[0].geometry);
+  const uniquePlates = [...new Set(floors.map(({ geometry }) => geometry))];
+  const coverage = uniquePlates.slice(1).reduce((combined, geometry) => scope.union(combined, geometry), uniquePlates[0]);
   const allCovered = ctx.retainedHandle ? scope.union(coverage, ctx.retainedHandle) : coverage;
   const coveredSite = scope.intersection(allCovered, plotHandle);
   const openGeometry = scope.difference(plotHandle, coveredSite);
@@ -72,6 +72,8 @@ export function checkConcept(
   let minPlotClearance = Infinity;
   let minNationalBoundaryMargin = Infinity;
   let minLocalBoundaryMargin = Infinity;
+  let minLocalBoundaryFloor = 0;
+  let governingLocalDistance = 0;
   let minNearOffset = Infinity;
   let minCenterOffset = Infinity;
   let roadHeightMargin = Infinity;
@@ -81,32 +83,50 @@ export function checkConcept(
   let allValid = true;
   let floorOverlap = false;
   const seenFloors = new Set<number>();
+  const measured = new Map<NativeGeometry, { minX: number; boundary: number; privateBoundary: number }>();
 
   for (const [index, floor] of floors.entries()) {
     const { geometry, topM } = floor;
-    const shape = scope.write(geometry);
-    allValid &&= !!shape && scope.valid(geometry);
-    if (!shape) continue;
-    const minX = extent(points(shape)).minX;
-    const localPrivateDistance = scope.distance(geometry, privateHandle);
+    if (!scope.isPolygon(geometry)) {
+      floorOverlap = true;
+      allValid = false;
+      continue;
+    }
+
+    let position = measured.get(geometry);
+    if (!position) {
+      allValid &&= scope.valid(geometry);
+      position = {
+        minX: scope.minX(geometry),
+        privateBoundary: scope.distance(geometry, privateHandle),
+        boundary: scope.distance(geometry, boundaryHandle),
+      };
+      measured.set(geometry, position);
+      maxExcess = Math.max(maxExcess, scope.area(scope.difference(geometry, plotHandle)));
+      if (ctx.retainedHandle) {
+        retainedCollision = Math.max(retainedCollision, scope.area(scope.intersection(geometry, ctx.retainedHandle)));
+        retainedClearance = Math.min(retainedClearance, scope.distance(geometry, ctx.retainedHandle));
+      }
+    }
+    const { minX, privateBoundary: localPrivateDistance, boundary } = position;
     const offsets = boundaryDistances(height, floor.floor, floor.topM);
-    maxExcess = Math.max(maxExcess, scope.area(scope.difference(geometry, plotHandle)));
-    minPlotClearance = Math.min(minPlotClearance, scope.distance(geometry, boundaryHandle));
+    minPlotClearance = Math.min(minPlotClearance, boundary);
     minNationalBoundaryMargin = Math.min(minNationalBoundaryMargin, localPrivateDistance - offsets.national);
-    minLocalBoundaryMargin = Math.min(minLocalBoundaryMargin, localPrivateDistance - offsets.local);
+    const localMargin = localPrivateDistance - offsets.local;
+    if (localMargin < minLocalBoundaryMargin) {
+      minLocalBoundaryMargin = localMargin;
+      minLocalBoundaryFloor = floor.floor;
+      governingLocalDistance = offsets.local;
+    }
     minNearOffset = Math.min(minNearOffset, minX - frame.nearX);
     minCenterOffset = Math.min(minCenterOffset, minX);
     roadHeightMargin = Math.min(roadHeightMargin, 2 * (minX - frame.farX) - topM);
-    if (index > 0) supportError = Math.max(
+    if (index > 0 && geometry !== floors[index - 1].geometry) supportError = Math.max(
       supportError,
       scope.area(scope.difference(geometry, floors[index - 1].geometry)),
     );
-    if (ctx.retainedHandle) {
-      retainedCollision = Math.max(retainedCollision, scope.area(scope.intersection(geometry, ctx.retainedHandle)));
-      retainedClearance = Math.min(retainedClearance, scope.distance(geometry, ctx.retainedHandle));
-    }
     const precedingTop = index === 0 ? 0 : floors[index - 1].topM;
-    floorOverlap ||= seenFloors.has(floor.floor) || shape.type === 'MultiPolygon'
+    floorOverlap ||= seenFloors.has(floor.floor)
       || floor.floor !== index + 1 || !Number.isFinite(topM) || topM <= floor.baseM
       || Math.abs(floor.baseM - precedingTop) > 1e-6;
     seenFloors.add(floor.floor);
@@ -131,9 +151,27 @@ export function checkConcept(
     );
   };
 
-  const checks: RuleResult[] = [
+  const checkedClearance = (national: boolean) => {
+    const requirement = national ? boundaryDistances(height, 1, floors[0].topM).national : governingLocalDistance;
+    const margin = national ? minNationalBoundaryMargin : minLocalBoundaryMargin;
+    const actualM = requirement + margin;
+    const qualifier = national
+      ? `Uses the ${meters(height)} whole-building height for every opening-bearing floor.`
+      : `Floor ${minLocalBoundaryFloor} governs. Requires 2 m on floors 1–2, or 3 m for floor 3+ or wall elevation over 9 m.`;
+    return {
+      ...rule(national ? 'private-national' : 'private-local',
+        national ? 'National opening clearance' : 'Bangkok opening clearance',
+        national ? 'แนวเขตที่ดิน' : 'ช่องเปิดและริมระเบียง',
+        national ? 'MR55 §50' : 'BMA §54', national ? NATIONAL : BANGKOK,
+        status(margin >= -DISTANCE_TOLERANCE), 'scenario',
+        `${actualM.toFixed(4)} m minimum · ${requirement.toFixed(2)} m required · ${margin.toFixed(4)} m margin. ${qualifier} Verification tolerance: 0.00001 m.`,
+        Math.abs(margin) < 0.15),
+      measurement: { actualM, requiredM: requirement, toleranceM: DISTANCE_TOLERANCE },
+    } satisfies RuleResult;
+  };
+  const results: RuleResult[] = [
     rule('plot', 'Plot containment and support', 'แนวเขตที่ดิน', 'Geometry check', PLAN,
-      status(allValid && maxExcess <= AREA_TOLERANCE && supportError <= AREA_TOLERANCE),
+      status(allValid && maxExcess <= GEOMETRY_AREA_TOLERANCE && supportError <= GEOMETRY_AREA_TOLERANCE),
       'scenario', `${square(maxExcess)} outside the plot. ${square(supportError)} unsupported above another plate.`),
     frontCheck('national', fronts.national),
     frontCheck('local', fronts.local),
@@ -147,14 +185,8 @@ export function checkConcept(
       status(roadHeightMargin >= -DISTANCE_TOLERANCE * 2), roadEvidence,
       `${meters(roadHeightMargin)} minimum headroom using the selected single public road and an assumed level road datum. Special wide-road access cases require separate analysis.`,
       Math.abs(roadHeightMargin) < 0.2),
-    rule('private-national', 'National opening clearance', 'แนวเขตที่ดิน', 'MR55 §50', NATIONAL,
-      status(minNationalBoundaryMargin >= -DISTANCE_TOLERANCE), 'scenario',
-      `The ${meters(height)} total building height sets ${height > 9 ? '3' : '2'} m on every opening-bearing plate. ${meters(minNationalBoundaryMargin)} minimum margin.`,
-      Math.abs(minNationalBoundaryMargin) < 0.15),
-    rule('private-local', 'Bangkok opening clearance', 'ช่องเปิดและริมระเบียง', 'BMA §54', BANGKOK,
-      status(minLocalBoundaryMargin >= -DISTANCE_TOLERANCE), 'scenario',
-      `2 m on floors 1–2 and 3 m where floor 3+ or wall elevation exceeds 9 m. ${meters(minLocalBoundaryMargin)} minimum margin.`,
-      Math.abs(minLocalBoundaryMargin) < 0.15),
+    checkedClearance(true),
+    checkedClearance(false),
     rule('all-around', 'All-around building clearance', 'ที่ว่างโดยรอบอาคาร', 'BMA §55', BANGKOK,
       perimeterDistance ? status(minPlotClearance + DISTANCE_TOLERANCE >= perimeterDistance) : 'not-applicable',
       perimeterDistance ? 'scenario' : 'documented',
@@ -163,33 +195,33 @@ export function checkConcept(
         : 'Detached residence at or below 300 m² is exempt from the 1 m all-around requirement.',
       perimeterDistance > 0 && Math.abs(minPlotClearance - perimeterDistance) < 0.15),
     rule('far', 'Floor area ratio', 'อัตราส่วนพื้นที่อาคารรวมต่อพื้นที่ดิน', '2013 plan §4, §16(1)', PLAN,
-      far === null ? 'review' : status(siteGfa! <= FAR * ctx.plotArea + AREA_TOLERANCE),
+      far === null ? 'review' : status(siteGfa! <= FAR * ctx.plotArea + BUDGET_TOLERANCE),
       far === null ? 'unknown' : 'scenario',
       far === null ? `${square(gfa)} new GFA. Retained GFA is unknown.`
         : `${square(siteGfa!)} site GFA ÷ ${square(ctx.plotArea)} eligible land = ${far.toFixed(2)}:1. Ceiling 7:1.`,
       siteGfa !== null && Math.abs(FAR * ctx.plotArea - siteGfa) <= 0.1),
     rule('osr', 'Open space ratio', 'อัตราส่วนของที่ว่างต่อพื้นที่อาคารรวม', '2013 plan §4, §16(2)', PLAN,
-      osr === null ? 'review' : status(openArea + AREA_TOLERANCE >= OSR * siteGfa!),
+      osr === null ? 'review' : status(openArea + BUDGET_TOLERANCE >= OSR * siteGfa!),
       osr === null ? 'unknown' : 'scenario',
       osr === null ? `${square(openArea)} uncovered. Total GFA is needed for the OSR denominator.`
         : `${square(openArea)} uncovered ÷ ${square(siteGfa!)} site GFA = ${percent(osr)}. Requires 4.5% of GFA.`,
       siteGfa !== null && Math.abs(openArea - OSR * siteGfa) <= 0.1),
     rule('site-open', 'Site open space', 'ที่ว่างต่อพื้นที่ที่ดิน', 'BMA §52(1)', BANGKOK,
-      status(openArea + AREA_TOLERANCE >= 0.3 * ctx.plotArea), 'scenario',
+      status(openArea + BUDGET_TOLERANCE >= 0.3 * ctx.plotArea), 'scenario',
       `${square(openArea)} uncovered ÷ ${square(ctx.plotArea)} plot = ${percent(openArea / ctx.plotArea)}. Applies the 30% residential standard conservatively to multifamily.`,
       Math.abs(openArea - 0.3 * ctx.plotArea) <= 0.1),
     rule('largest-floor-open', 'Largest floor open space', 'ที่ว่างภายนอกอาคาร', 'MR55 §33(1)', NATIONAL,
-      status(openArea + AREA_TOLERANCE >= 0.3 * largestFloor), 'scenario',
+      status(openArea + BUDGET_TOLERANCE >= 0.3 * largestFloor), 'scenario',
       `${square(openArea)} uncovered ÷ ${square(largestFloor)} largest new floor. Requires 30% of the largest floor.`,
       Math.abs(openArea - 0.3 * largestFloor) <= 0.1),
     rule('planting', 'Pervious planting', 'พื้นที่น้ำซึมผ่านได้เพื่อปลูกต้นไม้', '2013 plan §16(2)', PLAN,
-      status(plantOutsideOpen <= AREA_TOLERANCE && planted + AREA_TOLERANCE >= PLANTING * openArea), 'scenario',
+      status(plantOutsideOpen <= GEOMETRY_AREA_TOLERANCE && planted + BUDGET_TOLERANCE >= PLANTING * openArea), 'scenario',
       `${square(planted)} proposed pervious planting ÷ ${square(openArea)} qualifying uncovered site = ${percent(openArea ? planted / openArea : 0)}. Requires 50%. Surface and soil performance require verification.`,
       Math.abs(planted - PLANTING * openArea) <= 0.1),
     rule('floors', 'Floor areas and nonoverlap', 'พื้นที่อาคารรวม', '2013 plan §4', PLAN,
       status(!floorOverlap && (!reportedAreas || (reportedAreas.length === areas.length
-        && areas.every((area, i) => Math.abs(area - reportedAreas[i]) <= AREA_TOLERANCE)))),
-      'scenario', `${areas.map(square).join(' + ')} = ${square(gfa)} of new GFA.`),
+        && areas.every((area, i) => Math.abs(area - reportedAreas[i]) <= BUDGET_TOLERANCE)))),
+      'scenario', `${floors.length} independently measured floor plates total ${square(gfa)} of new GFA. The total sums full-precision areas. The floor schedule rounds each row for display.`),
     rule('category', 'High-rise and large-building bands', 'อาคารสูง / อาคารขนาดใหญ่', 'Building Control Act §4 · MR55 §1',
       BUILDING_ACT, status(!categories.high && !categories.large && !categories.extraLarge),
       'scenario', `${meters(height)} height and ${square(gfa)} GFA. High-rise starts at 23 m. Large and extra-large building profiles need separate evaluation.`),
@@ -201,7 +233,7 @@ export function checkConcept(
     rule('profile', 'Application profile limits', 'ขอบเขตการประเมิน', 'Model scope', '',
       status(floors.length <= profile.maxFloors
         && (input.profile === 'house' ? height <= profile.heightLimit : height < profile.heightLimit)
-        && (profile.gfaLimit === null || gfa <= profile.gfaLimit + AREA_TOLERANCE)),
+        && (profile.gfaLimit === null || gfa <= profile.gfaLimit + BUDGET_TOLERANCE)),
       'documented',
       `${floors.length}/${profile.maxFloors} model storeys. ${profile.gfaLimit === null ? 'No product GFA cap for this house profile.' : `${square(gfa)} of ${square(profile.gfaLimit)} product cap.`}`,
       profile.gfaLimit !== null && Math.abs(profile.gfaLimit - gfa) <= 0.1),
@@ -211,7 +243,7 @@ export function checkConcept(
       !localFrontageTrigger ? 'The supported low residential form does not trigger this frontage branch.'
         : `${meters(frontage?.longest ?? 0)} qualifying façade within 20 m, against more than ${meters((frontage?.perimeter ?? 0) / 8)}. ${meters(road!.frontageM)} modeled plot contact. Confirm the public access, or assess the alternative frontage and internal access provisions.`),
     rule('retained', 'Existing buildings and clearance', 'ระยะห่างระหว่างอาคาร', 'MR55 §48 · 2013 plan §4', NATIONAL,
-      input.redevelopment === 'retain' && (retainedCollision > AREA_TOLERANCE
+      input.redevelopment === 'retain' && (retainedCollision > GEOMETRY_AREA_TOLERANCE
         || retainedClearance + DISTANCE_TOLERANCE < 6) ? 'fail' : 'review',
       'scenario', input.redevelopment === 'clear'
         ? `${ctx.affected.length} intersecting mapped footprints. This concept assumes clearance inside the drawn boundary. Outside portions remain visible as context, and permissions for a straddling structure require review.`
@@ -230,5 +262,9 @@ export function checkConcept(
       'Determine actual unit count and usable area. The published multifamily thresholds include 80 units or 4,000 m² usable area.'),
   ];
 
-  return { checks, gfa, height, coveredArea, openArea, planted, areas };
+  return {
+    checks: results.filter(({ status: result }) => result !== 'review'),
+    siteEvidence: results.filter(({ status: result }) => result === 'review'),
+    gfa, height, coveredArea, openArea, planted, areas,
+  };
 }

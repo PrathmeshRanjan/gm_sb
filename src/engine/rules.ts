@@ -10,7 +10,11 @@ export const FAR = 7;
 export const OSR = 0.045;
 export const PLANTING = 0.5;
 export const AREA_TOLERANCE = 0.025;
-export const DISTANCE_TOLERANCE = 0.015;
+export const ROAD_ALIGNMENT_TOLERANCE = 0.015;
+export const DISTANCE_TOLERANCE = 1e-5;
+export const BUDGET_TOLERANCE = 1e-6;
+export const GEOMETRY_AREA_TOLERANCE = 1e-5;
+export const DESIGN_CLEARANCE_RESERVE_M = 0.002;
 
 export const PROFILES = {
   house: { gfaLimit: null, maxFloors: 2, heightLimit: 8, floorHeight: 3.2, minArea: 27, minDepth: 4 },

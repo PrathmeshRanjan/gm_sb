@@ -7,118 +7,213 @@ import type { Polygon } from 'geojson';
 import AnalysisMap, { type MapMode } from './AnalysisMap';
 import { loadContext, nearbyBuildings, type ContextData } from './context';
 import type {
-  CalculateRequest, CalculateResponse, Concept, ProfileId, RuleResult, ScenarioInput, ScenarioResult, Strategy,
+  CalculateRequest, CalculateResponse, Concept, FloorPlate, ProfileId, RuleResult, ScenarioInput, ScenarioResult, Strategy,
 } from './engine/types';
 
 const plan = 'https://download.asa.or.th/03media/04law/cpa/mr56-bma.pdf#page=35';
 const local = 'https://webportal.bangkok.go.th/public/user_files_editor/76/law/y07.pdf';
 const national = 'https://webportal.bangkok.go.th/public/user_files_editor/426/mr43-55-upd68.pdf';
 const format = new Intl.NumberFormat('en', { maximumFractionDigits: 1 });
+const twoPlaces = new Intl.NumberFormat('en', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const sqm = (n: number) => `${format.format(n)} m²`;
+const areaCents = (area: number) => Math.round(area * 100);
+const sqmCents = (cents: number) => `${twoPlaces.format(cents / 100)} m²`;
+const sqmExactDisplay = (area: number) => sqmCents(areaCents(area));
 const noIds: string[] = [];
+
+interface PendingCalculation extends CalculateRequest {
+  run: number;
+  sentAt: number;
+}
+
+interface SettledCalculation {
+  request: PendingCalculation;
+  result: ScenarioResult | null;
+  roundtrip: number;
+  error?: string;
+}
 
 function useAnalysis(input: ScenarioInput | null) {
   const worker = useRef<Worker | null>(null);
   const revision = useRef(0);
-  const sent = useRef(0);
+  const outstanding = useRef<PendingCalculation | null>(null);
   const [run, setRun] = useState(0);
-  const [result, setResult] = useState<ScenarioResult | null>(null);
-  const [pending, setPending] = useState(false);
-  const [error, setError] = useState('');
-  const [roundtrip, setRoundtrip] = useState(0);
+  const [settlement, setSettlement] = useState<SettledCalculation | null>(null);
+  const [workerError, setWorkerError] = useState('');
 
   useEffect(() => {
+    setWorkerError('');
     let instance: Worker;
     try {
       instance = new Worker(new URL('./geometry.worker.ts', import.meta.url), { type: 'module' });
     } catch {
-      setPending(false);
-      setResult(null);
-      setError('This browser could not start the geometry worker. Restart analysis to try again.');
+      setWorkerError('This browser could not start the geometry worker. Restart analysis to try again.');
       return;
     }
     worker.current = instance;
     instance.onmessage = ({ data }: MessageEvent<CalculateResponse>) => {
-      if (data.id !== revision.current) return;
-      setPending(false);
+      const request = outstanding.current;
+      if (worker.current !== instance || request?.id !== data.id) return;
+      outstanding.current = null;
+      const roundtrip = performance.now() - request.sentAt;
       if ('error' in data) {
-        setError(data.error);
-        setResult(null);
+        setSettlement({ request, result: null, error: data.error, roundtrip });
       } else {
-        setError('');
-        setResult(data.result);
-        setRoundtrip(performance.now() - sent.current);
+        setSettlement({ request, result: data.result, roundtrip });
       }
     };
+    function stop(message: string) {
+      if (worker.current !== instance) return;
+      worker.current = null;
+      outstanding.current = null;
+      instance.terminate();
+      setWorkerError(message);
+    }
     instance.onerror = (event) => {
       event.preventDefault();
-      setPending(false);
-      setResult(null);
-      setError('The geometry worker stopped. Restart analysis to try again.');
+      stop('The geometry worker stopped. Restart analysis to try again.');
     };
     instance.onmessageerror = () => {
-      setPending(false);
-      setResult(null);
-      setError('The browser could not read the geometry result. Restart analysis to try again.');
+      stop('The browser could not read the geometry result. Restart analysis to try again.');
     };
     return () => {
       instance.terminate();
       worker.current = null;
+      outstanding.current = null;
     };
   }, [run]);
 
   useEffect(() => {
-    const id = ++revision.current;
-    if (!worker.current) return;
-    setError('');
-    if (!input) {
-      setPending(false);
-      setResult(null);
-      return;
-    }
-    setPending(true);
+    outstanding.current = null;
+    if (!worker.current || !input) return;
     const task = window.setTimeout(() => {
-      sent.current = performance.now();
-      worker.current?.postMessage({ id, input } satisfies CalculateRequest);
+      const instance = worker.current;
+      if (!instance) return;
+      const id = ++revision.current;
+      const request = { id, input, run, sentAt: performance.now() };
+      outstanding.current = request;
+      try {
+        instance.postMessage({ id, input } satisfies CalculateRequest);
+      } catch {
+        outstanding.current = null;
+        setSettlement({ request, result: null, error: 'The scenario could not be sent to the geometry worker.', roundtrip: 0 });
+      }
     }, 55);
     return () => {
       window.clearTimeout(task);
-      ++revision.current;
+      outstanding.current = null;
     };
   }, [input, run]);
 
-  return { result, pending, error, roundtrip, restart: () => setRun((value) => value + 1) };
+  const current = !workerError && settlement?.request.input === input && settlement.request.run === run ? settlement : null;
+  return {
+    result: current?.result ?? null,
+    pending: input !== null && current === null && !workerError,
+    error: workerError || current?.error || '',
+    roundtrip: current?.roundtrip ?? 0,
+    requestId: current?.result ? current.request.id : undefined,
+    resultWidth: current?.result ? current.request.input.road.widthM : undefined,
+    restart: () => setRun((value) => value + 1),
+  };
 }
 
 function Source({ href, children }: { href: string; children: React.ReactNode }) {
   return <a className="source-link" href={href} target="_blank" rel="noreferrer">{children}<ArrowUpRight size={13} /></a>;
 }
 
-function Rules({ rules }: { rules: RuleResult[] }) {
-  if (!rules.length) return <p className="empty-text">Draw a plot and provide a right-of-way width to calculate rule outcomes.</p>;
+type RuleGroup = 'envelope' | 'design' | 'evidence';
 
+function Rules({ rules, group, emptyText }: { rules: RuleResult[]; group: RuleGroup; emptyText: string }) {
+  if (!rules.length) return <p className="empty-text">{emptyText}</p>;
   const states = { pass: 'Pass', fail: 'Fail', review: 'Review', 'not-applicable': 'Not applicable' };
   const evidence = { documented: 'Documented', scenario: 'Scenario', unknown: 'Unverified' };
+  function outcome(rule: RuleResult) {
+    if (group === 'envelope' && rule.status === 'pass') {
+      return rule.controls ? { label: 'Constrains', style: 'constrains' } : { label: 'Nonbinding', style: 'nonbinding' };
+    }
+    if (group === 'envelope' && rule.status === 'not-applicable') return { label: 'Not applied', style: 'not-applicable' };
+    return { label: states[rule.status], style: rule.status };
+  }
 
   return <div className="rule-list">
-    {rules.map((rule) => (
-      <details className="rule-row" key={rule.id}>
-        <summary>
-          <span className="rule-name">{rule.label}{rule.controls && <span className="binding-tag">Controls</span>}</span>
-          <span className={`rule-status ${rule.status}`}>{states[rule.status]}</span>
-          <span className="evidence-summary" title="Evidence status">{evidence[rule.evidence]}</span>
-          <ChevronDown size={14} className="rule-chevron" />
-        </summary>
-        <div className="rule-detail">
-          <p>{rule.detail}</p>
-          {rule.thai && <p className="thai-term" lang="th">{rule.thai}</p>}
-          <div className="rule-meta">
-            {rule.sourceUrl && <Source href={rule.sourceUrl}>{rule.clause || 'Source'}</Source>}
+    {rules.map((rule) => {
+      const { label, style } = outcome(rule);
+      return (
+        <details className="rule-row" key={rule.id}>
+          <summary>
+            <span className="rule-name">{rule.label}</span>
+            <span className={`rule-status ${style}`}>{label}</span>
+            <span className="evidence-summary" title="Evidence status">{evidence[rule.evidence]}</span>
+            <ChevronDown size={14} className="rule-chevron" />
+          </summary>
+          <div className="rule-detail">
+            <p>{rule.detail}</p>
+            {rule.measurement && <dl className="rule-measurement" data-testid={`measurement-${rule.id}`}>
+              <div><dt>Measured clearance</dt><dd>{rule.measurement.actualM.toFixed(4)} m</dd></div>
+              <div><dt>Required clearance</dt><dd>{rule.measurement.requiredM.toFixed(4)} m</dd></div>
+              <div><dt>Margin</dt><dd>{(rule.measurement.actualM - rule.measurement.requiredM).toFixed(4)} m</dd></div>
+              <div><dt>Verifier tolerance</dt><dd>{rule.measurement.toleranceM.toFixed(5)} m</dd></div>
+            </dl>}
+            {rule.thai && <p className="thai-term" lang="th">{rule.thai}</p>}
+            <div className="rule-meta">
+              {rule.sourceUrl && <Source href={rule.sourceUrl}>{rule.clause || 'Source'}</Source>}
+            </div>
           </div>
-        </div>
-      </details>
-    ))}
+        </details>
+      );
+    })}
   </div>;
+}
+
+function FloorSchedule({ floors, total, kind }: {
+  floors: Pick<FloorPlate, 'floor' | 'topM' | 'areaM2'>[];
+  total: number;
+  kind: 'envelope' | 'design';
+}) {
+  const totalCents = areaCents(total);
+  const rowsCents = floors.reduce((sum, floor) => sum + areaCents(floor.areaM2), 0);
+  const difference = rowsCents - totalCents;
+  return <>
+    <table className="floor-schedule" aria-label={kind === 'envelope' ? 'Permissible envelope slices' : 'Actual design floor areas'}>
+      <thead><tr><th scope="col">Floor</th><th scope="col">Top elevation</th><th scope="col">{kind === 'envelope' ? 'Permissible slice' : 'Plate area'}</th></tr></thead>
+      <tbody>
+        {floors.map((floor) => <tr key={floor.floor}><th scope="row">{floor.floor}</th><td>{twoPlaces.format(floor.topM)} m</td><td>{sqmExactDisplay(floor.areaM2)}</td></tr>)}
+      </tbody>
+      <tfoot><tr><th colSpan={2} scope="row">{kind === 'envelope' ? 'Slice-area sum' : 'Total design GFA'}</th><td>{sqmCents(totalCents)}</td></tr></tfoot>
+    </table>
+    <p className="fine-print rounding-note" data-testid={`${kind}-rounding-note`}>
+      The total uses full-precision polygon areas. Each displayed value is rounded to two decimal places.
+      {difference !== 0 && ` The displayed rows sum to ${sqmCents(rowsCents)}, ${sqmCents(Math.abs(difference))} ${difference > 0 ? 'more' : 'less'} than the displayed total.`}
+    </p>
+  </>;
+}
+
+function DesignSchedule({ concept }: { concept: Concept }) {
+  return <details className="inspection-details" data-testid="design-floor-schedule">
+    <summary><span>Floor-area schedule</span><span className="inspection-value">{sqmExactDisplay(concept.gfaM2)}</span><ChevronDown size={15} /></summary>
+    <div className="inspection-body"><FloorSchedule floors={concept.floors} total={concept.gfaM2} kind="design" /></div>
+  </details>;
+}
+
+function BoundExplanation({ result, onViewBound }: { result: ScenarioResult | null; onViewBound: () => void }) {
+  const bound = result?.boundExplanation;
+  if (!bound) return null;
+  return <details className="inspection-details" data-testid="bound-explanation">
+    <summary><span>Inspect geometric bound</span><span className="inspection-value">{sqmExactDisplay(bound.sumM2)}</span><ChevronDown size={15} /></summary>
+    <div className="inspection-body">
+      <dl className="bound-candidate">
+        <div><dt>Bound candidate</dt><dd>{bound.floorCount} {bound.floorCount === 1 ? 'floor' : 'floors'} · {twoPlaces.format(bound.heightM)} m</dd></div>
+        <div><dt>Building classification</dt><dd>{bound.classification.join(' · ')}</dd></div>
+      </dl>
+      <FloorSchedule floors={bound.floors} total={bound.sumM2} kind="envelope" />
+      <div className="bound-constraints">
+        <div><h3>Included in the slices</h3><ul>{bound.included.map((item) => <li key={item}>{item}</li>)}</ul></div>
+        <div><h3>Excluded from the slice sum</h3><ul>{bound.excluded.map((item) => <li key={item}>{item}</li>)}</ul></div>
+      </div>
+      <p className="fine-print">{bound.reason}</p>
+      <button type="button" className="text-button bound-view" data-testid="show-envelope-bound" onClick={onViewBound}><Layers3 size={15} /> Show bound in 3D</button>
+    </div>
+  </details>;
 }
 
 function Capacity({ result, concept }: { result: ScenarioResult | null; concept: Concept | null }) {
@@ -127,10 +222,10 @@ function Capacity({ result, concept }: { result: ScenarioResult | null; concept:
     ? 'below 23 m'
     : `up to ${format.format(capacity?.profileHeightLimitM ?? 0)} m`;
   return <dl className="capacity-table">
-    <div><dt><span className="budget-dot legal" /> Regulatory FAR ceiling <small>Base FAR {capacity?.regulatoryFar ?? '7'}:1 × eligible site</small></dt><dd>{capacity ? sqm(capacity.regulatoryGfaCeilingM2) : '—'}</dd></div>
-    <div><dt><span className="budget-dot geometric" /> Geometry bound <small>Sum of permissible floor slices</small></dt><dd>{capacity ? sqm(capacity.geometricGfaUpperBoundM2) : '—'}</dd></div>
-    <div><dt><span className="budget-dot profile" /> Supported profile <small>{capacity ? `${capacity.profileMaxFloors} floors · ${heightLimit}` : 'Application scope'}</small></dt><dd>{capacity?.profileGfaLimitM2 != null ? sqm(capacity.profileGfaLimitM2) : '—'}</dd></div>
-    <div><dt><span className="budget-dot design" /> Selected design <small>Sum of generated occupied plates</small></dt><dd>{concept ? sqm(concept.gfaM2) : '—'}</dd></div>
+    <div><dt><span className="budget-dot legal" /> Regulatory FAR ceiling <small>Base FAR {capacity?.regulatoryFar ?? '7'}:1 × eligible site</small></dt><dd>{capacity ? sqmExactDisplay(capacity.regulatoryGfaCeilingM2) : '—'}</dd></div>
+    <div><dt><span className="budget-dot geometric" /> Geometric upper bound <small>Sum of permissible floor slices</small></dt><dd>{capacity ? sqmExactDisplay(capacity.geometricGfaUpperBoundM2) : '—'}</dd></div>
+    <div><dt><span className="budget-dot profile" /> Application profile limits <small>{capacity ? `${capacity.profileMaxFloors} floors · ${heightLimit}` : 'Supported scope'}</small></dt><dd>{capacity?.profileGfaLimitM2 != null ? sqmExactDisplay(capacity.profileGfaLimitM2) : '—'}</dd></div>
+    <div><dt><span className="budget-dot design" /> Achieved design GFA <small>Sum of generated occupied plates</small></dt><dd>{concept ? sqmExactDisplay(concept.gfaM2) : '—'}</dd></div>
   </dl>;
 }
 
@@ -157,7 +252,7 @@ function ConceptCard({ strategy, concept, message, active, onSelect }: {
         ? <span>{concept.floors.length} {concept.floors.length === 1 ? 'floor' : 'floors'} · {format.format(concept.heightM)} m</span>
         : <span>{message || 'Awaiting a feasible envelope'}</span>}
     </span>
-    {concept && <span className="concept-area">{sqm(concept.gfaM2)}</span>}
+    {concept && <span className="concept-area">{sqmExactDisplay(concept.gfaM2)}</span>}
     {concept && (active ? <Check className="selected-check" size={16} /> : <ArrowRight size={14} />)}
   </button>;
 }
@@ -211,8 +306,11 @@ function Workspace({ context }: { context: ContextData }) {
   const [selected, setSelected] = useState<Strategy>('wide');
   const [tab, setTab] = useState<'scenario' | 'rules'>('scenario');
   const dialog = useRef<HTMLDialogElement>(null);
+  const sidebarContent = useRef<HTMLDivElement>(null);
+  const designSection = useRef<HTMLElement>(null);
+  const jumpToDesign = useRef(false);
   const road = roadOptions.find((option) => String(option.wayId) === roadId) ?? baselineRoad;
-  const widthText = widthOverride ?? (road.width != null ? String(road.width) : '');
+  const widthText = widthOverride ?? (road.width != null ? road.width.toFixed(2) : '');
   const widthM = Number(widthText);
   const validWidth = widthText.trim() !== '' && Number.isFinite(widthM) && widthM > 0 && widthM <= 100;
 
@@ -240,13 +338,35 @@ function Workspace({ context }: { context: ContextData }) {
     };
   }, [baselineRoad.wayId, context.buildings, edge, plot, profile, redevelopment, retainedAmounts, road, validWidth, widthM, widthOverride]);
 
-  const { result, pending, error, roundtrip, restart } = useAnalysis(input);
+  const { result, pending, error, roundtrip, requestId, resultWidth, restart } = useAnalysis(input);
   const concept = result?.concepts.find(({ id }) => id === selected) ?? result?.concepts[0] ?? null;
-  const allRules = [...(result?.rules ?? []), ...(concept?.checks ?? [])];
+  const siteEvidence = [...(result?.siteEvidence ?? []), ...(concept?.siteEvidence ?? [])];
   const affectedIds = result?.affectedBuildingIds ?? noIds;
-  const controls = [...new Set(allRules.filter((rule) => rule.controls).map((rule) => rule.label))];
   const open = concept && result?.plotAreaM2 ? (concept.openM2 / result.plotAreaM2) * 100 : null;
   const editing = mode === 'vertices' || mode === 'draw';
+  const resultProvenance = { 'data-request-id': requestId, 'data-result-width': resultWidth };
+  const search = result?.search;
+
+  useEffect(() => {
+    if (tab === 'rules' && jumpToDesign.current) {
+      designSection.current?.scrollIntoView({ block: 'start' });
+      designSection.current?.focus({ preventScroll: true });
+    } else {
+      sidebarContent.current?.scrollTo({ top: 0 });
+    }
+    jumpToDesign.current = false;
+  }, [tab]);
+
+  function inspectDesign() {
+    jumpToDesign.current = true;
+    setTab('rules');
+  }
+
+  function showBound() {
+    setEnvelopeVisible(true);
+    setConceptVisible(false);
+    setMode('3d');
+  }
 
   function changePlot(next: Polygon) {
     if (next.coordinates[0].length !== plot.coordinates[0].length || mode === 'draw') setEdge(undefined);
@@ -284,6 +404,8 @@ function Workspace({ context }: { context: ContextData }) {
           onMode={setMode}
           onPlot={changePlot}
           result={result}
+          requestId={requestId}
+          resultWidth={resultWidth}
           concept={conceptVisible ? concept : null}
           centerline={road.centerline}
           roadName={road.name}
@@ -307,7 +429,7 @@ function Workspace({ context }: { context: ContextData }) {
           <div className="eyebrow"><span className="location-dot" /> INTHAMARA STUDY AREA</div>
           <div className="sidebar-heading"><h1>Pracha Suk</h1><button type="button" className="icon-button reset-button" data-testid="reset-scenario" onClick={reset} title="Reset scenario" aria-label="Reset scenario"><RotateCcw size={18} /></button></div>
           <p className="site-meta">Residential feasibility · 2013 Bangkok plan</p>
-          <div className="top-metrics">
+          <div className="top-metrics" data-testid="scenario-metrics" {...resultProvenance}>
             <div><span>Scenario parcel</span><strong>{result?.plotAreaM2 != null ? format.format(result.plotAreaM2) : '—'} <small>m²</small></strong></div>
             <div><span>Design GFA</span><strong>{concept ? format.format(concept.gfaM2) : '—'} <small>m²</small></strong></div>
             <div><span>Site open area</span><strong>{open != null ? format.format(open) : '—'} <small>%</small></strong></div>
@@ -315,11 +437,11 @@ function Workspace({ context }: { context: ContextData }) {
         </div>
 
         <div className="sidebar-tabs" role="tablist" aria-label="Analysis sections">
-          <button role="tab" type="button" aria-selected={tab === 'scenario'} onClick={() => setTab('scenario')}>Scenario</button>
-          <button role="tab" type="button" aria-selected={tab === 'rules'} onClick={() => setTab('rules')}>Rules & evidence</button>
+          <button id="scenario-tab" role="tab" type="button" aria-controls="analysis-panel" aria-selected={tab === 'scenario'} onClick={() => setTab('scenario')}>Scenario</button>
+          <button id="rules-tab" role="tab" type="button" aria-controls="analysis-panel" aria-selected={tab === 'rules'} onClick={() => setTab('rules')}>Rules & evidence</button>
         </div>
 
-        <div className="sidebar-content">
+        <div id="analysis-panel" role="tabpanel" aria-labelledby={`${tab}-tab`} className="sidebar-content" ref={sidebarContent}>
           {error && <div className="alert-msg" role="alert"><CircleAlert size={17} /><div>{error}<button type="button" onClick={restart}>Restart analysis</button></div></div>}
           {!error && result?.message && <div className={`alert-msg ${result.validation === 'valid' ? 'note' : ''}`} role="status"><CircleAlert size={17} /><div>{result.message}</div></div>}
           {tab === 'scenario' ? <>
@@ -346,8 +468,10 @@ function Workspace({ context }: { context: ContextData }) {
                 {widthOverride !== null ? <span className="what-if-tag">What-if width</span> : road.width != null ? <Source href={road.sourceUrl}>District inventory</Source> : <span>Width unavailable</span>}
                 {widthOverride !== null && road.width != null && <button className="text-button" type="button" onClick={() => setWidthOverride(null)}>Restore {road.width.toFixed(2)} m</button>}
                 {widthOverride === null && road.width != null && <button className="text-button" type="button" onClick={() => setWidthOverride('6')}>Try 6 m</button>}
+                {road.width != null && widthM !== 2 && <button className="text-button" type="button" onClick={() => setWidthOverride('2')}>2 m stress test</button>}
               </div>
               {!validWidth && <p className="inline-error">Enter a scenario width greater than 0 m and at most 100 m.</p>}
+              {widthOverride !== null && widthM === 2 && <p className="fine-print road-stress-note">The narrow road can clip upper envelope slices. A design may keep the same area when all of its plates fit inside the revised slices.</p>}
               <div className="input-row">
                 <label htmlFor="frontage-edge">Parcel frontage</label>
                 <select id="frontage-edge" data-testid="frontage-select" value={edge ?? ''} onChange={(event) => setEdge(event.target.value === '' ? undefined : Number(event.target.value))}>
@@ -378,7 +502,7 @@ function Workspace({ context }: { context: ContextData }) {
 
             <section className="analysis-section concepts-section">
               <div className="section-heading"><h2>Design concepts</h2><span className="muted-count">{result?.concepts.length ?? 0} available</span></div>
-              <div className="concept-list">
+              <div className="concept-list" data-testid="concept-list" {...resultProvenance}>
                 {(['wide', 'stepped'] as const).map((strategy) => <ConceptCard
                   key={strategy}
                   strategy={strategy}
@@ -388,31 +512,55 @@ function Workspace({ context }: { context: ContextData }) {
                   message={result?.conceptMessages[strategy]}
                 />)}
               </div>
-              {concept && <button type="button" className="text-button inspect-button" onClick={() => setTab('rules')}>Inspect selected design checks <ArrowRight size={15} /></button>}
+              {concept && <>
+                <div className="concept-rationale">
+                  <p>{concept.rationale}</p>
+                  <p>{concept.tradeOff}</p>
+                  {concept.limitingFactors.length > 0 && <p><strong>What limited this design</strong><br />{concept.limitingFactors.join(' · ')}</p>}
+                </div>
+                <DesignSchedule concept={concept} />
+                <button type="button" className="text-button inspect-button" onClick={inspectDesign}>Inspect selected design checks <ArrowRight size={15} /></button>
+              </>}
+              {search && <details className="assumption-details search-details">
+                <summary>Search and design assumptions <ChevronDown size={14} /></summary>
+                <p>{format.format(search.evaluated)} candidates generated. {format.format(search.independentlyChecked)} independently checked, {format.format(search.validated)} passed the modeled checks.</p>
+                {search.bestValidatedGfaM2 != null && <p><strong>Best validated GFA found</strong> {sqmExactDisplay(search.bestValidatedGfaM2)}. The search covers a bounded set of candidate forms.</p>}
+                <p>Design heuristics: at least {sqm(search.minimumPlateM2)} per plate and a {format.format(search.minimumCoreWidthM)} m minimum core width. These thresholds describe the form generator.</p>
+              </details>}
             </section>
           </> : <>
             <section className="analysis-section">
               <div className="section-heading"><h2>Capacity</h2><Source href={plan}>Plan §16</Source></div>
               <Capacity result={result} concept={concept} />
-              <p className="fine-print">Floor-slice envelopes test the top of each proposed storey. Area and planting budgets are calculated on the design separately.</p>
-              <p className="fine-print">{controls.length ? `Controls in this scenario: ${controls.join(', ')}.` : 'No active constraint has been identified in the current result.'}</p>
-              {concept && <dl className="area-detail">
-                <div><dt>Covered projection</dt><dd>{sqm(concept.coveredM2)}</dd></div>
-                <div><dt>Qualifying open area</dt><dd>{sqm(concept.openM2)}</dd></div>
-                <div><dt>Pervious planting</dt><dd>{sqm(concept.perviousM2)}</dd></div>
-                <div><dt>Largest floor</dt><dd>{sqm(Math.max(...concept.floors.map((f) => f.areaM2)))}</dd></div>
-              </dl>}
+              <BoundExplanation result={result} onViewBound={showBound} />
             </section>
-            <section className="analysis-section">
-              <div className="section-heading"><h2>Rule checks</h2>{concept && <span className="muted-count">{concept.id === 'wide' ? 'Wider / lower' : 'Narrower / stepped'}</span>}</div>
-              <p className="fine-print">Expand a result for the limit, source clause, and evidence status.</p>
-              <Rules rules={allRules} />
+            <section className="analysis-section" data-testid="envelope-rules" {...resultProvenance}>
+              <div className="section-heading"><h2>Envelope constraints</h2></div>
+              <p className="fine-print">These rows describe the building height and floor count used to compute the geometric bound.</p>
+              <Rules rules={result?.rules ?? []} group="envelope" emptyText="No bound constraints are available for this scenario." />
+            </section>
+            <section className="analysis-section" data-testid="design-rules" data-concept-id={concept?.id} ref={designSection} tabIndex={-1} {...resultProvenance}>
+              <div className="section-heading"><h2>Selected-design checks</h2>{concept && <span className="muted-count">{concept.id === 'wide' ? 'Wider / lower' : 'Narrower / stepped'}</span>}</div>
+              <p className="fine-print">These checks use the actual selected design. Its height and floor count can trigger different rules from the bound candidate.</p>
+              {concept && <dl className="area-detail">
+                <div><dt>Covered projection</dt><dd>{sqmExactDisplay(concept.coveredM2)}</dd></div>
+                <div><dt>Qualifying open area</dt><dd>{sqmExactDisplay(concept.openM2)}</dd></div>
+                <div><dt>Pervious planting</dt><dd>{sqmExactDisplay(concept.perviousM2)}</dd></div>
+                <div><dt>Largest floor</dt><dd>{sqmExactDisplay(Math.max(...concept.floors.map((f) => f.areaM2)))}</dd></div>
+              </dl>}
+              {concept && <DesignSchedule concept={concept} />}
+              <Rules rules={concept?.checks ?? []} group="design" emptyText="No generated design is available for these inputs." />
+            </section>
+            <section className="analysis-section" data-testid="evidence-rules" {...resultProvenance}>
+              <div className="section-heading"><h2>Unresolved site and design evidence</h2></div>
+              <p className="fine-print">Confirm the facts below before relying on the modeled checks for a real development.</p>
+              <Rules rules={siteEvidence} group="evidence" emptyText={result ? 'No outstanding evidence was returned.' : 'A calculated scenario is needed before evidence can be listed.'} />
             </section>
           </>}
         </div>
 
         <div className="sidebar-footer" aria-live="polite">
-          {!pending && result ? <span data-testid="result-ready" data-state={result.validation} data-elapsed-ms={result.elapsedMs} data-roundtrip-ms={roundtrip}><i className={result.validation === 'valid' ? 'ready' : 'needs-review'} /> {result.validation === 'valid' ? 'Scenario calculated' : 'Scenario needs review'}</span>
+          {!pending && result ? <span data-testid="result-ready" {...resultProvenance} data-state={result.validation} data-elapsed-ms={result.elapsedMs} data-roundtrip-ms={roundtrip}><i className={result.validation === 'valid' ? 'ready' : 'needs-review'} /> {result.validation === 'valid' ? 'Scenario calculated' : 'Scenario needs review'}</span>
             : <span><i className={pending ? 'busy' : 'needs-review'} /> {pending ? 'Calculating…' : 'Waiting for inputs'}</span>}
           {!pending && result && <span>{Math.round(result.elapsedMs)} ms</span>}
           <button type="button" className="mobile-source text-button" onClick={() => dialog.current?.showModal()}>Sources <ExternalLink size={12} /></button>

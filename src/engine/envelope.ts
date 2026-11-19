@@ -19,7 +19,7 @@ export function fromRoadReference(ctx: Prepared, limit: RoadLimit) {
 export function floorEnvelopes(
   ctx: Prepared, floorCount: number, categoryGfa: number, measureControls = false,
 ) {
-  const { scope, plotHandle, privateHandle, retainedHandle, input, frame } = ctx;
+  const { scope, plotHandle, boundaryHandle, privateHandle, retainedHandle, input, frame } = ctx;
   const profile = PROFILES[input.profile];
   const totalHeightM = floorCount * profile.floorHeight;
   const perimeter = clearance(input.profile, totalHeightM, categoryGfa);
@@ -28,14 +28,15 @@ export function floorEnvelopes(
     clearance: false, nationalFront: false, localFront: false,
     nationalBoundary: false, localBoundary: false, roadHeight: false,
   };
-  const retainedBuffer = retainedHandle ? scope.buffer(retainedHandle, 6) : null;
+  const retainedBuffer = retainedHandle ? scope.clearanceBand(retainedHandle, 6) : null;
   const site = retainedBuffer ? scope.difference(plotHandle, retainedBuffer) : plotHandle;
-  const allAround = perimeter ? scope.buffer(plotHandle, -perimeter) : null;
-  const base = allAround ? scope.intersection(site, allAround) : site;
+  const allAround = perimeter ? scope.clearanceBand(boundaryHandle, perimeter) : null;
+  const base = allAround ? scope.difference(site, allAround) : site;
   const nationalFrontX = fromRoadReference(ctx, front.national);
   const localFrontX = fromRoadReference(ctx, front.local);
   const drivingFrontX = Math.max(nationalFrontX, localFrontX, frame.nearX);
-  const privateBands = new Map<number, NativeGeometry>();
+  const privateBands = new Map<number, { band: NativeGeometry; after: NativeGeometry }>();
+  const sliceByCut = new Map<string, NativeGeometry>();
   const floors: NativeFloor[] = [];
 
   for (let floor = 1; floor <= floorCount; floor++) {
@@ -43,15 +44,21 @@ export function floorEnvelopes(
     const baseM = (floor - 1) * profile.floorHeight;
     const privateDistances = boundaryDistances(totalHeightM, floor, topM);
     const drivingDistance = Math.max(privateDistances.national, privateDistances.local);
-    let privateBand = privateBands.get(drivingDistance);
-    if (!privateBand) {
-      privateBand = scope.buffer(privateHandle, drivingDistance);
-      privateBands.set(drivingDistance, privateBand);
+    let privateCut = privateBands.get(drivingDistance);
+    if (!privateCut) {
+      const band = scope.clearanceBand(privateHandle, drivingDistance);
+      privateCut = { band, after: scope.difference(base, band) };
+      privateBands.set(drivingDistance, privateCut);
     }
-    const afterBoundary = scope.difference(base, privateBand);
+    const { band: privateBand, after: afterBoundary } = privateCut;
     const roadHeightX = frame.farX + topM / 2;
     const roadX = Math.max(drivingFrontX, roadHeightX);
-    const geometry = clipRoadSide(ctx, afterBoundary, roadX);
+    const cutKey = `${drivingDistance}:${roadX}`;
+    let geometry = sliceByCut.get(cutKey);
+    if (!geometry) {
+      geometry = clipRoadSide(ctx, afterBoundary, roadX);
+      sliceByCut.set(cutKey, geometry);
+    }
     floors.push({ floor, baseM, topM, geometry });
 
     if (measureControls) {
@@ -74,5 +81,5 @@ export function floorEnvelopes(
       });
     }
   }
-  return { floors, restrictions };
+  return { floors, restrictions, front, perimeter, totalHeightM };
 }

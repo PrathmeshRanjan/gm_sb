@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bangkok Site Study verification</title>
+<style>
+  * { box-sizing: border-box }
+  body { margin: 0; background: #f4f6f2; color: #17362b; font: 16px/1.5 system-ui, sans-serif }
+  main { max-width: 78rem; padding: 2.5rem 1.25rem 4rem; margin: auto }
+  a { color: #185e48 }
+  h1 { margin: 1rem 0 .35rem; font-size: clamp(2rem, 3.7vw, 3rem); line-height: 1.1 }
+  p { margin: 0 0 2rem; max-width: 52rem }
+  section { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 28rem), 1fr)); gap: 1.25rem }
+  figure { margin: 0; overflow: hidden; border: 1px solid #d4dfd6; border-radius: .65rem; background: white }
+  img { display: block; width: 100%; aspect-ratio: 1440 / 980; object-fit: contain }
+  figcaption { padding: .75rem 1rem; font-weight: 650 }
+</style>
+<main>
+  <a href="/">Open Bangkok Site Study</a>
+  <h1>Browser verification</h1>
+  <p>Actual screenshots of the production build on Chromium using Apple M1 hardware WebGL. Open each image at full size to read the calculations and rule details.</p>
+  <section aria-label="Verification screenshots">
+    <figure><a href="./wide.jpg"><img src="./wide.jpg" alt="Wider concept and floor area in the 3D neighborhood map"></a><figcaption>Wider / lower concept</figcaption></figure>
+    <figure><a href="./stepped.jpg"><img src="./stepped.jpg" alt="Stepped concept and floor area in the 3D neighborhood map"></a><figcaption>Narrower / stepped concept</figcaption></figure>
+    <figure><a href="./edited-parcel.jpg"><img src="./edited-parcel.jpg" alt="Plan view with editable points on a newly drawn concave parcel"></a><figcaption>Drawn and edited irregular parcel</figcaption></figure>
+    <figure><a href="./capacity.jpg"><img src="./capacity.jpg" alt="Capacity quantities and road reference lines beside the baseline 3D parcel"></a><figcaption>Baseline capacity and road references</figcaption></figure>
+    <figure><a href="./height-plane-stress.jpg"><img src="./height-plane-stress.jpg" alt="Changed height-plane slices under the two-meter road-width stress scenario"></a><figcaption>Height-plane stress scenario</figcaption></figure>
+    <figure><a href="./numerical-checks.jpg"><img src="./numerical-checks.jpg" alt="Opening clearance measurement with actual distance, requirement, margin, and tolerance"></a><figcaption>Opening clearance measurement</figcaption></figure>
+    <figure><a href="./floor-schedule.jpg"><img src="./floor-schedule.jpg" alt="Individual plate areas and full-precision aggregate shown at two decimal places"></a><figcaption>Floor-area schedule and rounding policy</figcaption></figure>
+  </section>
+</main>
+</html>

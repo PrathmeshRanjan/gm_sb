@@ -3,14 +3,16 @@ import { generateDesign } from './design';
 import { floorEnvelopes } from './envelope';
 import type { NativeFloor } from './envelope';
 import { withGeos } from './geos';
-import { BANGKOK, FAR, NATIONAL, PLAN, PROFILES, rule } from './rules';
+import { BANGKOK, classify, FAR, NATIONAL, PLAN, PROFILES, rule } from './rules';
+import type { RoadLimit } from './rules';
 import { mapArea, normalizePlot } from './spatial';
 import type { Concept, RuleResult, ScenarioInput, ScenarioResult } from './types';
 import { checkConcept } from './validate';
 
 const blank = (): ScenarioResult => ({
   validation: 'invalid', plotAreaM2: 0, coverageVerified: false, road: null,
-  affectedBuildingIds: [], preservedBuildingParts: [], capacity: null, envelope: [], concepts: [], conceptMessages: {}, rules: [], elapsedMs: 0,
+  affectedBuildingIds: [], preservedBuildingParts: [], capacity: null, envelope: [], boundExplanation: null,
+  search: null, concepts: [], conceptMessages: {}, rules: [], siteEvidence: [], elapsedMs: 0,
 });
 
 export async function calculateScenario(input: ScenarioInput): Promise<ScenarioResult> {
@@ -77,28 +79,66 @@ export async function calculateScenario(input: ScenarioInput): Promise<ScenarioR
         retainedGfaM2: ctx.retainedGfa,
       };
       const restrictions = model?.restrictions;
-      const envelopeEvidence = 'scenario';
-      const modelBool = (active?: boolean) => active ? 'Controls part of the displayed envelope.' : 'Does not reduce the displayed envelope.';
+      if (model) {
+        const categories = classify(model.totalHeightM, categoryGfa);
+        const classification = [input.profile === 'house' ? 'Detached residential' : 'Multifamily residential'];
+        classification.push(categories.high ? 'High-rise by height' : 'Below the 23 m high-rise threshold');
+        if (categories.specialByHeight) classification.push('Special building by height. Structural and safety review required');
+        classification.push(categories.large ? 'Large building by modeled area' : 'Large building category excluded');
+        result.boundExplanation = {
+          heightM: model.totalHeightM,
+          classification,
+          floorCount: chosenCount,
+          floors: model.floors.map(({ floor, baseM, topM, geometry }) => ({
+            floor, baseM, topM, areaM2: scope.area(geometry),
+          })),
+          sumM2: Math.max(0, maxArea),
+          included: [
+            'Scenario parcel, modeled right-of-way, national and Bangkok opening and front setbacks, all-around clearance, and the road height plane',
+            '3.2 m floor-to-floor and the selected supported height/category band',
+            ...(ctx.retainedHandle ? ['Conservative 6 m buffer around retained mapped coverage'] : []),
+          ],
+          excluded: [
+            'FAR, cumulative new/retained GFA and application GFA cap are assessed separately from the slice sum',
+            'Open space and planting budgets, floor continuity and practical dimensions, access, parking and floor plans',
+          ],
+          reason: 'This is the largest slice sum among supported building heights. It assumes every slice can be filled completely, including disconnected pieces. A shorter concept can have wider individual floors because its whole-building setbacks differ. Each design still has to connect its plates, fit the separate budgets, and pass its own checks.',
+        };
+      }
+      const effect = (active?: boolean) => active ? 'Reduces at least one slice.' : 'Does not reduce the displayed slices after other limits.';
+      const describeFront = (limit: RoadLimit) =>
+        limit ? `${limit.distance.toFixed(2)} m from the ${limit.reference === 'centerline' ? 'centerline' : 'near right-of-way edge'}.`
+          : 'This setback branch is not triggered for the bound height and road width.';
+      result.siteEvidence = [
+        rule('plot-basis', 'Drawn plot boundary', 'แนวเขตที่ดิน', 'Site evidence', '',
+          'review', 'scenario', 'Editable scenario polygon in verified ย.๙-๑๓ coverage. Its edges, title, and easements require survey or title evidence.'),
+        rule('road-basis', 'Road width and alignment', 'เขตทาง', 'BMA §5(4)', input.road.sourceUrl ?? BANGKOK,
+          'review', 'scenario',
+          `${ctx.road!.widthM.toFixed(2)} m total modeled width. ${ctx.road!.frontageM.toFixed(2)} m modeled parcel contact. ${ctx.road!.inferred ? 'Road edges inferred from the mapped centerline.' : 'Edge lines supplied.'} Confirm legal frontage, public access and road/plot elevations.`),
+      ];
       result.rules = [
-        rule('zone', '2013 residential zoning', 'ที่ดินประเภทที่อยู่อาศัยหนาแน่นมาก', '2013 plan §16 · ย.๙-๑๓', PLAN,
-          'pass', 'documented', 'Scenario is inside the officially checked study area. This screens residential use under the active plan.'),
-        rule('plot-basis', 'Drawn plot boundary', 'แนวเขตที่ดิน', 'Site evidence', PLAN,
-          'review', 'scenario', 'Editable scenario polygon. Its edges, title, and easements require survey or title evidence.'),
-        rule('road-basis', 'Road width and alignment', 'เขตทาง', 'BMA §5(4)', BANGKOK,
-          ctx.road!.frontageM > 0 ? 'pass' : 'review', envelopeEvidence,
-          `${ctx.road!.widthM.toFixed(2)} m total modeled width. ${ctx.road!.frontageM.toFixed(2)} m modeled plot contact. ${ctx.road!.inferred ? 'Road edges inferred from the mapped centerline.' : 'Edge lines supplied.'} Confirm public access and elevations.`),
         rule('national-front', 'National front building line', 'การร่นแนวอาคาร', 'MR55 §41', NATIONAL,
-          'pass', envelopeEvidence, modelBool(restrictions?.nationalFront), restrictions?.nationalFront),
+          model?.front.national ? 'pass' : 'not-applicable', 'scenario',
+          `${describeFront(model?.front.national ?? null)} ${model?.front.national ? effect(restrictions?.nationalFront) : ''}`,
+          restrictions?.nationalFront),
         rule('local-front', 'Bangkok front building line', 'การร่นแนวอาคาร', 'BMA §50', BANGKOK,
-          'pass', envelopeEvidence, modelBool(restrictions?.localFront), restrictions?.localFront),
+          model?.front.local ? 'pass' : 'not-applicable', 'scenario',
+          `${describeFront(model?.front.local ?? null)} ${model?.front.local ? effect(restrictions?.localFront) : ''}`,
+          restrictions?.localFront),
         rule('national-private', 'National private-boundary clearance', 'แนวเขตที่ดิน', 'MR55 §50', NATIONAL,
-          'pass', envelopeEvidence, modelBool(restrictions?.nationalBoundary), restrictions?.nationalBoundary),
+          'pass', 'scenario', `Uses ${model && model.totalHeightM > 9 ? 3 : 2} m from private boundaries on each opening-bearing floor at the bound building's total height. ${effect(restrictions?.nationalBoundary)}`,
+          restrictions?.nationalBoundary),
         rule('local-private', 'Bangkok private-boundary clearance', 'ช่องเปิดและริมระเบียง', 'BMA §54', BANGKOK,
-          'pass', envelopeEvidence, modelBool(restrictions?.localBoundary), restrictions?.localBoundary),
+          'pass', 'scenario', `Applies the opening setback by storey/elevation and combines it with the national setback. ${effect(restrictions?.localBoundary)}`,
+          restrictions?.localBoundary),
         rule('perimeter-clearance', 'All-around clearance', 'ที่ว่างโดยรอบอาคาร', 'BMA §55', BANGKOK,
-          'pass', envelopeEvidence, modelBool(restrictions?.clearance), restrictions?.clearance),
+          model?.perimeter ? 'pass' : 'not-applicable', 'scenario', model?.perimeter
+            ? `${model.perimeter} m reserved inside the drawn plot around all sides. ${effect(restrictions?.clearance)}`
+            : 'The small detached housing band exempts the displayed upper-bound model from this requirement.',
+          restrictions?.clearance),
         rule('height-plane', 'Road-derived height plane', 'แนวเขตด้านตรงข้าม', 'MR55 §44 · BMA §49', NATIONAL,
-          'pass', envelopeEvidence, modelBool(restrictions?.roadHeight), restrictions?.roadHeight),
+          'pass', 'scenario', `Clips each slab top at twice the perpendicular distance to the far right-of-way edge. ${effect(restrictions?.roadHeight)}`,
+          restrictions?.roadHeight),
       ];
       if (result.envelope.length === 0) {
         result.message = 'The combined clearances leave an empty buildable envelope.';
@@ -110,17 +150,28 @@ export async function calculateScenario(input: ScenarioInput): Promise<ScenarioR
       }
 
       const wide = scope.temporary(() => generateDesign(ctx, 'wide'));
-      const stepped = scope.temporary(() => generateDesign(ctx, 'stepped', wide ?? undefined));
-      if (wide) result.concepts.push(wide);
-      else result.conceptMessages.wide = 'No connected lower form fits the clearance, minimum dimensions, and area budgets.';
-      if (stepped) result.concepts.push(stepped);
-      else result.conceptMessages.stepped = 'No distinct stepped form fits the upper slices, support depth, and area budgets.';
+      const stepped = scope.temporary(() => generateDesign(ctx, 'stepped', wide.concept ?? undefined));
+      const checkedGfa = [wide.bestValidatedGfaM2, stepped.bestValidatedGfaM2].filter((area): area is number => area !== null);
+      result.search = {
+        evaluated: wide.evaluated + stepped.evaluated,
+        independentlyChecked: wide.independentlyChecked + stepped.independentlyChecked,
+        validated: wide.validated + stepped.validated,
+        bestValidatedGfaM2: checkedGfa.length ? Math.max(...checkedGfa) : null,
+        minimumPlateM2: profile.minArea,
+        minimumCoreWidthM: profile.minDepth,
+      };
+      if (wide.concept) result.concepts.push(wide.concept);
+      else result.conceptMessages.wide = 'No connected lower form fit the clearance, minimum dimensions, and area budgets.';
+      if (stepped.concept) result.concepts.push(stepped.concept);
+      else result.conceptMessages.stepped = 'No meaningfully smaller footprint fit the upper slices, support depth, and area budgets.';
       return result;
     } catch (error) {
       result.message = error instanceof Error ? error.message : 'Could not calculate this scenario.';
       result.validation = 'invalid';
       result.capacity = null;
       result.envelope = [];
+      result.boundExplanation = null;
+      result.search = null;
       result.concepts = [];
       return result;
     } finally {
@@ -142,6 +193,7 @@ export async function validateGeneratedConcept(input: ScenarioInput, proposal: C
       ...floor, geometry: scope.read(mapArea(floor.geometry, ctx.frame.toLocal)),
     }));
     const planting = proposal.planting && scope.read(mapArea(proposal.planting, ctx.frame.toLocal));
-    return checkConcept(ctx, floors, planting, proposal.floors.map((floor) => floor.areaM2)).checks;
+    const audit = checkConcept(ctx, floors, planting, proposal.floors.map((floor) => floor.areaM2));
+    return [...audit.checks, ...audit.siteEvidence];
   });
 }

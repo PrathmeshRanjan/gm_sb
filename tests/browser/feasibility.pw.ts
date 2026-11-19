@@ -1,5 +1,5 @@
 import { mkdir, readdir, readFile } from 'node:fs/promises';
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 import type { Polygon } from 'geojson';
 import proj4 from 'proj4';
 import type { CalculateResponse, ScenarioInput } from '../../src/engine/types';
@@ -27,6 +27,12 @@ const syntheticBase: ScenarioInput = {
     publicStatus: 'assumed',
   },
 };
+
+async function capture(page: Page, name: string) {
+  const prefix = process.env.FEASIBILITY_URL ? 'live' : 'candidate';
+  await mkdir('artifacts', { recursive: true });
+  await page.screenshot({ path: `artifacts/${prefix}-${name}.png`, animations: 'disabled' });
+}
 
 test('production Worker projects, clips, rejects invalid geometry, and measures recalculation', async ({ page }) => {
   const workerFile = (await readdir('dist/assets')).find((file) => /^geometry\.worker-.+\.js$/.test(file));
@@ -111,6 +117,19 @@ test('production Worker projects, clips, rejects invalid geometry, and measures 
   expect(results[7].rules.find(({ id }) => id === 'height-plane')?.controls).toBe(true);
   expect(results[8].plotAreaM2).toBeCloseTo(results[5].plotAreaM2, 4);
   expect(results[8].validation).toBe('road-conflict');
+  expect(results[8].road?.conflictM2).toBeCloseTo(45, 2);
+  expect(results[8].concepts).toHaveLength(0);
+  console.log(`Baseline audit ${JSON.stringify({
+    boundM2: results[5].boundExplanation?.sumM2,
+    stressBoundM2: results[7].boundExplanation?.sumM2,
+    search: results[5].search,
+    designs: results[5].concepts.map((concept) => ({
+      id: concept.id, floors: concept.floors.length, gfaM2: concept.gfaM2,
+      coveredM2: concept.coveredM2, openM2: concept.openM2,
+      opening: concept.checks.find(({ id }) => id === 'private-national')?.measurement,
+      stressGfaM2: results[7].concepts.find(({ id }) => id === concept.id)?.gfaM2,
+    })),
+  })}`);
   const percentile = (values: number[], p: number) => values.sort((a, b) => a - b)[Math.ceil(p * values.length) - 1];
   const stats = {
     coldMs,
@@ -136,6 +155,17 @@ test('public-facing map loads real context and updates a scenario in place', asy
   await expect(result).toHaveAttribute('data-state', 'valid');
   await expect(page.getByTestId('site-map').locator('canvas.maplibregl-canvas')).toBeVisible();
   await expect(page.getByTestId('view-plan')).toBeEnabled();
+  const graphics = await page.evaluate(() => {
+    const gl = document.createElement('canvas').getContext('webgl2');
+    const debug = gl?.getExtension('WEBGL_debug_renderer_info');
+    return { webgl: !!gl, renderer: gl && debug ? String(gl.getParameter(debug.UNMASKED_RENDERER_WEBGL)) : null };
+  });
+  expect(graphics.webgl).toBe(true);
+  if (process.env.FEASIBILITY_HARDWARE_WEBGL === '1') {
+    expect(graphics.renderer).toBeTruthy();
+    expect(graphics.renderer).not.toMatch(/SwiftShader|software|llvmpipe/i);
+  }
+  console.log(`WebGL renderer ${graphics.renderer}`);
   console.log(`Initial scenario and map ready ${Math.round(await page.evaluate(() => performance.now()))} ms after navigation`);
   await expect(page.getByTestId('concept-wide')).toBeVisible();
   await expect(page.getByTestId('concept-stepped')).toBeVisible();
@@ -144,9 +174,7 @@ test('public-facing map loads real context and updates a scenario in place', asy
   }
   await page.getByTestId('concept-wide').click();
   await page.waitForTimeout(400);
-  await mkdir('artifacts', { recursive: true });
-  const suffix = process.env.FEASIBILITY_URL ? 'public' : 'local';
-  await page.screenshot({ path: `artifacts/${suffix}-wide-3d.png`, animations: 'disabled' });
+  await capture(page, 'wide');
 
   const width = page.getByTestId('road-width');
   await width.fill('6');
@@ -159,10 +187,16 @@ test('public-facing map loads real context and updates a scenario in place', asy
   await expect(result).toHaveAttribute('data-state', 'valid');
   await page.getByTestId('concept-stepped').click();
   await page.waitForTimeout(400);
-  await page.screenshot({ path: `artifacts/${suffix}-stepped-3d.png`, animations: 'disabled' });
+  await capture(page, 'stepped');
+  const canvas = page.getByTestId('site-map').locator('canvas.maplibregl-canvas');
+  const beforeZoom = await canvas.screenshot();
+  await page.getByRole('button', { name: 'Zoom in' }).click();
+  await page.waitForTimeout(500);
+  expect((await canvas.screenshot()).equals(beforeZoom)).toBe(false);
+  await page.getByRole('button', { name: 'Zoom out' }).click();
+  await page.waitForTimeout(500);
   await page.getByTestId('view-plan').click();
   await page.waitForTimeout(400);
-  await page.screenshot({ path: `artifacts/${suffix}-stepped-plan.png`, animations: 'disabled' });
 
   const parcelMetric = page.getByRole('complementary', { name: 'Scenario analysis' })
     .getByText('Scenario parcel', { exact: true }).locator('..');
@@ -179,6 +213,17 @@ test('public-facing map loads real context and updates a scenario in place', asy
   }
   await expect(parcelMetric).not.toHaveText(baseline);
   await expect(result, 'new plot adjoining the modeled road').toHaveAttribute('data-state', 'valid');
+  const drawnArea = await parcelMetric.innerText();
+  const [vertexX, vertexY] = drawPoints[0];
+  const x = mapBounds!.x + mapBounds!.width * vertexX;
+  const y = mapBounds!.y + mapBounds!.height * vertexY;
+  await page.mouse.move(x, y);
+  await page.mouse.down();
+  await page.mouse.move(x - 18, y - 5, { steps: 8 });
+  await page.mouse.up();
+  await expect(parcelMetric).not.toHaveText(drawnArea);
+  await expect(result, 'edited irregular plot adjoining the modeled road').toHaveAttribute('data-state', 'valid');
+  await capture(page, 'edited-parcel');
   await page.getByTestId('reset-scenario').click();
   await expect(result).toHaveAttribute('data-state', 'valid');
   await page.getByTestId('view-3d').click();
@@ -197,7 +242,90 @@ test('public-facing map loads real context and updates a scenario in place', asy
   await page.getByText('Regulatory FAR ceiling', { exact: false }).scrollIntoViewIfNeeded();
   expect(await mapPanel.boundingBox()).toEqual(beforeRules);
   await page.waitForTimeout(500);
-  await page.screenshot({ path: `artifacts/${suffix}-capacity-and-rules.png`, animations: 'disabled' });
+  await capture(page, 'capacity');
   expect(page.url()).toBe(currentUrl);
   expect(errors).toEqual([]);
+});
+
+test('rapid edits reject a delayed stale response and recover from a road conflict', async ({ page }) => {
+  await page.addInitScript(() => {
+    const NativeWorker = window.Worker;
+    const probe = { held: false, released: false };
+    Object.assign(window, { workerResponseProbe: probe });
+    window.Worker = class extends NativeWorker {
+      private readonly analysisWorker: boolean;
+      private holdId: number | undefined;
+
+      constructor(url: string | URL, options?: WorkerOptions) {
+        super(url, options);
+        this.analysisWorker = String(url).includes('geometry.worker');
+        if (!this.analysisWorker) return;
+        this.addEventListener('message', (event) => {
+          if (event.data?.id !== this.holdId || probe.held) return;
+          event.stopImmediatePropagation();
+          probe.held = true;
+          window.setTimeout(() => {
+            this.dispatchEvent(new MessageEvent('message', { data: event.data }));
+            probe.released = true;
+          }, 3200);
+        });
+      }
+
+      postMessage(message: unknown, options?: StructuredSerializeOptions) {
+        const request = message as { id?: number; input?: { road?: { widthM?: number } } } | null;
+        if (this.analysisWorker && request?.input?.road?.widthM === 6) this.holdId = request.id;
+        super.postMessage(message, options);
+      }
+    };
+  });
+  await page.goto('/');
+  const result = page.getByTestId('result-ready');
+  await expect(result).toHaveAttribute('data-state', 'valid');
+  const width = page.getByTestId('road-width');
+  await width.fill('6');
+  await page.waitForFunction(() => (window as Window & { workerResponseProbe?: { held: boolean } }).workerResponseProbe?.held);
+  await width.fill('2');
+  await expect(result).toHaveAttribute('data-result-width', '2');
+  const currentId = await result.getAttribute('data-request-id');
+  expect(currentId).toBeTruthy();
+  for (const id of ['site-map', 'scenario-metrics', 'concept-list']) {
+    await expect(page.getByTestId(id)).toHaveAttribute('data-request-id', currentId!);
+  }
+  await page.waitForFunction(() => (window as Window & { workerResponseProbe?: { released: boolean } }).workerResponseProbe?.released);
+  await expect(result).toHaveAttribute('data-request-id', currentId!);
+  await expect(page.getByTestId('site-map')).toHaveAttribute('data-request-id', currentId!);
+  await page.getByRole('tab', { name: 'Rules & evidence' }).click();
+  for (const id of ['envelope-rules', 'design-rules', 'evidence-rules']) {
+    await expect(page.getByTestId(id)).toHaveAttribute('data-request-id', currentId!);
+  }
+  await page.getByTestId('bound-explanation').locator('summary').click();
+  await page.getByTestId('show-envelope-bound').click();
+  await page.getByTestId('bound-explanation').locator('summary').scrollIntoViewIfNeeded();
+  await capture(page, 'height-plane-stress');
+
+  await page.getByRole('tab', { name: 'Scenario' }).click();
+  await width.fill('14.7');
+  await expect(result).toHaveAttribute('data-state', 'road-conflict');
+  await expect(page.getByTestId('site-map')).toHaveAttribute('data-result-width', '14.7');
+  await expect(page.getByTestId('site-map')).toHaveAttribute('data-envelope-floors', '0');
+  await expect(page.getByText(/45\.00 m²/)).toBeVisible();
+  await expect(page.getByTestId('scenario-metrics')).toContainText('828');
+  await expect(page.getByTestId('concept-wide')).toBeDisabled();
+  await expect(page.getByTestId('concept-stepped')).toBeDisabled();
+  await page.getByRole('button', { name: /Restore 11\.70 m/ }).click();
+  await expect(result).toHaveAttribute('data-state', 'valid');
+  await expect(result).toHaveAttribute('data-result-width', '11.7');
+  await expect(page.getByTestId('concept-wide')).toBeEnabled();
+  await expect(page.getByTestId('concept-stepped')).toBeEnabled();
+  await page.getByRole('tab', { name: 'Rules & evidence' }).click();
+  await page.getByText('National opening clearance', { exact: true }).click();
+  const margin = page.getByTestId('measurement-private-national');
+  await expect(margin).toBeVisible();
+  await expect(margin).toContainText('0.00001 m');
+  await margin.scrollIntoViewIfNeeded();
+  await capture(page, 'numerical-checks');
+  const schedule = page.getByTestId('design-floor-schedule');
+  await schedule.locator('summary').click();
+  await page.getByTestId('design-rounding-note').scrollIntoViewIfNeeded();
+  await capture(page, 'floor-schedule');
 });

@@ -2,6 +2,7 @@ import { defineConfig } from '@playwright/test';
 
 const localUrl = 'http://127.0.0.1:4173';
 const deployedUrl = process.env.FEASIBILITY_URL;
+const hardware = process.env.FEASIBILITY_HARDWARE_WEBGL === '1';
 
 export default defineConfig({
   testDir: 'tests/browser',
@@ -11,9 +12,10 @@ export default defineConfig({
   use: {
     baseURL: deployedUrl ?? localUrl,
     viewport: { width: 1440, height: 980 },
+    headless: !hardware,
     launchOptions: {
       channel: 'chromium',
-      args: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader'],
+      args: hardware ? [] : ['--use-angle=swiftshader', '--enable-unsafe-swiftshader'],
     },
   },
   webServer: deployedUrl

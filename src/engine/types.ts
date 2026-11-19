@@ -41,6 +41,7 @@ export interface RuleResult {
   evidence: 'documented' | 'scenario' | 'unknown';
   detail: string;
   controls?: boolean;
+  measurement?: { actualM: number; requiredM: number; toleranceM: number };
 }
 
 export interface FloorPlate {
@@ -62,6 +63,30 @@ export interface Concept {
   perviousM2: number;
   planting: AreaGeometry | null;
   checks: RuleResult[];
+  siteEvidence: RuleResult[];
+  rationale: string;
+  tradeOff: string;
+  limitingFactors: string[];
+}
+
+export interface BoundExplanation {
+  heightM: number;
+  classification: string[];
+  floorCount: number;
+  floors: { floor: number; baseM: number; topM: number; areaM2: number }[];
+  sumM2: number;
+  included: string[];
+  excluded: string[];
+  reason: string;
+}
+
+export interface SearchSummary {
+  evaluated: number;
+  independentlyChecked: number;
+  validated: number;
+  bestValidatedGfaM2: number | null;
+  minimumPlateM2: number;
+  minimumCoreWidthM: number;
 }
 
 export interface ScenarioResult {
@@ -90,6 +115,9 @@ export interface ScenarioResult {
     retainedGfaM2: number | null;
   } | null;
   envelope: FloorPlate[];
+  boundExplanation: BoundExplanation | null;
+  search: SearchSummary | null;
+  siteEvidence: RuleResult[];
   concepts: Concept[];
   conceptMessages: Partial<Record<Strategy, string>>;
   rules: RuleResult[];

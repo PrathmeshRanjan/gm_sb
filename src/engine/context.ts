@@ -1,6 +1,6 @@
 import type { MultiLineString, Polygon, Position } from 'geojson';
 import type { GeometryScope, NativeGeometry } from './geos';
-import { AREA_TOLERANCE, DISTANCE_TOLERANCE } from './rules';
+import { AREA_TOLERANCE, ROAD_ALIGNMENT_TOLERANCE } from './rules';
 import { box, extent, line, mapArea, points, roadFrame } from './spatial';
 import type { AreaGeometry, ScenarioInput, ScenarioResult } from './types';
 import { STUDY_BBOX } from './types';
@@ -60,9 +60,9 @@ export function prepare(scope: GeometryScope, input: ScenarioInput, plot: Polygo
     scope.read(box(frame.farX, roadStart, nearEdge, roadEnd)),
   )));
   const widthConflict = overlapAt(frame.nearX);
-  const conflictsWithRoad = overlapAt(frame.nearX - DISTANCE_TOLERANCE) > AREA_TOLERANCE;
-  const alignmentVerified = localBounds.minY >= roadStart - DISTANCE_TOLERANCE
-    && localBounds.maxY <= roadEnd + DISTANCE_TOLERANCE;
+  const conflictsWithRoad = overlapAt(frame.nearX - ROAD_ALIGNMENT_TOLERANCE) > AREA_TOLERANCE;
+  const alignmentVerified = localBounds.minY >= roadStart - ROAD_ALIGNMENT_TOLERANCE
+    && localBounds.maxY <= roadEnd + ROAD_ALIGNMENT_TOLERANCE;
   const frontageMatched = localBounds.minX < frame.baseNearX + 3;
   const affected: NonNullable<ScenarioInput['retainedBuildings']> = [];
   const preservedBuildingParts: ScenarioResult['preservedBuildingParts'] = [];

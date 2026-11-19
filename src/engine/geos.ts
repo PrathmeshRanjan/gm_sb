@@ -2,6 +2,7 @@ import initGeos from 'geos-wasm';
 import { geojsonToGeosGeom, geosGeomToGeojson } from 'geos-wasm/helpers';
 import type { Geometry, Polygon } from 'geojson';
 import type { AreaGeometry } from './types';
+import { DESIGN_CLEARANCE_RESERVE_M } from './rules';
 
 type Geos = Awaited<ReturnType<typeof initGeos>>;
 export type NativeGeometry = number;
@@ -75,6 +76,20 @@ export class GeometryScope {
     return this.geos.Module.getValue(this.scalar, 'double');
   }
 
+  isPolygon(geometry: NativeGeometry) {
+    return this.geos.GEOSGeomTypeId(geometry) === 3 && this.geos.GEOSisEmpty(geometry) !== 1;
+  }
+
+  minX(geometry: NativeGeometry) {
+    if (!this.geos.GEOSGeom_getXMin(geometry, this.scalar)) throw new Error('No minimum x for this geometry.');
+    return this.geos.Module.getValue(this.scalar, 'double');
+  }
+
+  maxX(geometry: NativeGeometry) {
+    if (!this.geos.GEOSGeom_getXMax(geometry, this.scalar)) throw new Error('No maximum x for this geometry.');
+    return this.geos.Module.getValue(this.scalar, 'double');
+  }
+
   valid(geometry: NativeGeometry) {
     return this.geos.GEOSisValid(geometry) === 1;
   }
@@ -91,8 +106,17 @@ export class GeometryScope {
     return this.own(this.geos.GEOSUnion(a, b));
   }
 
-  buffer(geometry: NativeGeometry, distance: number) {
-    return this.own(this.geos.GEOSBufferWithStyle(geometry, distance, 8, 1, 2, 4));
+  buffer(geometry: NativeGeometry, distance: number, quadrantSegments = 8) {
+    return this.own(this.geos.GEOSBufferWithStyle(geometry, distance, quadrantSegments, 1, 2, 4));
+  }
+
+  clearanceBand(geometry: NativeGeometry, required: number) {
+    const quadrantSegments = 16;
+    // GEOS round caps are inscribed chords. Inflate their apothem to the required
+    // distance plus a small reserve, so a slab cut at a chord still clears the line.
+    const conservativeRadius = (required + DESIGN_CLEARANCE_RESERVE_M)
+      / Math.cos(Math.PI / (4 * quadrantSegments));
+    return this.buffer(geometry, conservativeRadius, quadrantSegments);
   }
 
   length(geometry: NativeGeometry) {
@@ -100,20 +124,28 @@ export class GeometryScope {
     return this.geos.Module.getValue(this.scalar, 'double');
   }
 
-  largestPolygon(geometry: NativeGeometry): Polygon | null {
-    const output = this.write(geometry);
-    if (!output) return null;
-    if (output.type === 'Polygon') return output;
-    let best: Polygon | null = null;
-    let largest = 0;
-    for (const coordinates of output.coordinates) {
-      const polygon: Polygon = { type: 'Polygon', coordinates };
-      const area = this.temporary(() => this.area(this.read(polygon)));
-      if (area > largest) {
-        best = polygon;
-        largest = area;
+  largestComponent(geometry: NativeGeometry): NativeGeometry | null {
+    const type = this.geos.GEOSGeomTypeId(geometry);
+    if (type === 3) return this.geos.GEOSisEmpty(geometry) === 1 ? null : geometry;
+    if (type !== 6 && type !== 7) return null;
+    let largest: NativeGeometry | null = null;
+    let maximumArea = 0;
+    const count = this.geos.GEOSGetNumGeometries(geometry);
+    for (let index = 0; index < count; index++) {
+      // GEOSGetGeometryN returns a borrowed pointer kept alive by the parent geometry.
+      const candidate = this.largestComponent(this.geos.GEOSGetGeometryN(geometry, index));
+      if (!candidate) continue;
+      const candidateArea = this.area(candidate);
+      if (candidateArea > maximumArea) {
+        largest = candidate;
+        maximumArea = candidateArea;
       }
     }
-    return best;
+    return largest;
+  }
+
+  largestPolygon(geometry: NativeGeometry): Polygon | null {
+    const largest = this.largestComponent(geometry);
+    return largest ? this.write(largest) as Polygon : null;
   }
 }

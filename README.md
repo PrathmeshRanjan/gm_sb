@@ -15,12 +15,13 @@ npx playwright install chromium
 npm run test:browser
 ```
 
-To run the same browser checks against the deployed build, set `FEASIBILITY_URL` to the public origin. Keep the matching local `dist` because the tests identify the hashed worker asset from that build. Playwright writes verification screenshots under `artifacts/`.
+To run the same browser checks against the deployed build, set `FEASIBILITY_URL` to the public origin. Keep the matching local `dist` because the tests identify the hashed worker asset from that build. Set `FEASIBILITY_HARDWARE_WEBGL=1` to open Chromium with the laptop's default WebGL renderer. Playwright writes verification screenshots under `artifacts/`.
 
 ## Evidence and scope
 
 - [Phase 1 research](PHASE-1-RESEARCH.md) records the statutory clauses and zoning evidence.
 - [Implementation evidence](research/IMPLEMENTATION-EVIDENCE.md) records the source extracts, assumptions and reproduction commands. [The public data manifest](public/data/manifest.json) credits the shipped neighborhood data.
+- [Numerical review](research/NUMERICAL-REVIEW.md) documents the clearance construction, verifier tolerances, displayed floor arithmetic, and stress fixture.
 - The applicant’s raw transcript, BMA downloads and original research PDF are kept locally outside the published site and Git source.
 - The product estimates building massing for small detached houses and standalone multifamily buildings. It reports zoning ceilings, geometric bounds, profile limits and generated designs as distinct quantities. Site-dependent rule results retain their evidence status.
 

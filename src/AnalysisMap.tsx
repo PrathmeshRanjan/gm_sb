@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import maplibregl, { type FillExtrusionLayerSpecification, type FillLayerSpecification, type GeoJSONSource, type Map as MapInstance, type StyleSpecification } from 'maplibre-gl';
 import { TerraDraw, TerraDrawPolygonMode, TerraDrawSelectMode } from 'terra-draw';
 import { TerraDrawMapLibreGLAdapter } from 'terra-draw-maplibre-gl-adapter';
@@ -16,6 +16,8 @@ interface Props {
   onMode: (mode: MapMode) => void;
   onPlot: (plot: Polygon) => void;
   result: ScenarioResult | null;
+  requestId?: number;
+  resultWidth?: number;
   concept: Concept | null;
   centerline: LineString;
   roadName: string;
@@ -26,6 +28,7 @@ interface Props {
 }
 
 const empty: FeatureCollection = { type: 'FeatureCollection', features: [] };
+const scenarioSources = ['plot', 'road-reference', 'envelope', 'design', 'planting', 'preserved-buildings'] as const;
 
 const layout: StyleSpecification = {
   version: 8,
@@ -43,7 +46,8 @@ function plateFeatures(plates: FloorPlate[]) {
 }
 
 function setData(map: MapInstance, name: string, data: FeatureCollection) {
-  (map.getSource(name) as GeoJSONSource | undefined)?.setData(data);
+  const source = map.getSource(name) as GeoJSONSource | undefined;
+  return source?.setData(data, true) ?? Promise.resolve();
 }
 
 const buildingFootprintPaint = {
@@ -62,7 +66,7 @@ function addLayers(map: MapInstance, data: ContextData) {
   map.addSource('coverage', { type: 'geojson', data: collection([feature(data.site.coverage, {})]) });
   map.addSource('roads', { type: 'geojson', data: data.roads });
   map.addSource('buildings', { type: 'geojson', data: data.buildings });
-  for (const id of ['plot', 'road-reference', 'envelope', 'design', 'planting', 'preserved-buildings']) {
+  for (const id of scenarioSources) {
     map.addSource(id, { type: 'geojson', data: empty });
   }
 
@@ -153,7 +157,7 @@ function addLayers(map: MapInstance, data: ContextData) {
 }
 
 export default function AnalysisMap(props: Props) {
-  const { context, plot, mode, result, concept, centerline, roadName, frontageEdgeIndex, footprintsOnly, envelopeVisible, clearedIds } = props;
+  const { context, plot, mode, result, requestId, resultWidth, concept, centerline, roadName, frontageEdgeIndex, footprintsOnly, envelopeVisible, clearedIds } = props;
   const mapEl = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapInstance | null>(null);
   const drawRef = useRef<TerraDraw | null>(null);
@@ -165,7 +169,12 @@ export default function AnalysisMap(props: Props) {
   const [loaded, setLoaded] = useState(false);
   const [mapError, setMapError] = useState('');
   const [editError, setEditError] = useState('');
+  const [applied, setApplied] = useState<{ result: ScenarioResult; concept: Concept | null } | null>(null);
   const [bearing, setBearing] = useState(context.site.camera.bearing);
+  const rendered = applied !== null && applied.result === result && applied.concept === concept;
+  const originalBuildings = useMemo(() => new Map(
+    context.buildings.features.map(({ properties }) => [String(properties.id), properties]),
+  ), [context.buildings]);
   latest.current = props;
 
   useEffect(() => {
@@ -292,12 +301,12 @@ export default function AnalysisMap(props: Props) {
     }
   }, [context, loaded, mode]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const map = mapRef.current;
     if (!map || !loaded) return;
-    setData(map, 'plot', collection([feature(plot, {
+    const plotSource = collection([feature(plot, {
       warning: result?.validation === 'outside-coverage' || result?.validation === 'road-conflict' || result?.validation === 'invalid',
-    })]));
+    })]);
     const reference = [feature(centerline, { kind: 'centerline' })];
     if (result?.road) {
       reference.push(feature(result.road.nearEdge, { kind: 'near' }), feature(result.road.farEdge, { kind: 'far' }));
@@ -308,46 +317,63 @@ export default function AnalysisMap(props: Props) {
         reference.push(feature({ type: 'LineString', coordinates: ring.slice(frontageEdgeIndex, frontageEdgeIndex + 2) }, { kind: 'frontage' }));
       }
     }
-    setData(map, 'road-reference', collection(reference));
-    setData(map, 'envelope', collection(plateFeatures(result?.envelope ?? [])));
-    setData(map, 'design', collection(plateFeatures(concept?.floors ?? [])));
-    setData(map, 'planting', collection(concept?.planting ? [feature(concept.planting, {})] : []));
-  }, [loaded, plot, result, concept, centerline, frontageEdgeIndex]);
+    const pieces = clearedIds.length ? (result?.preservedBuildingParts ?? []).flatMap(({ id, geometry }) => {
+      const properties = originalBuildings.get(id);
+      return properties ? [feature(geometry, properties)] : [];
+    }) : [];
+    let current = true;
+    const finish = () => {
+      // A setData promise can resolve early when MapLibre queues a second update.
+      // Wait for every source to finish its active update and drain its queue.
+      if (!current || !scenarioSources.every((id) => (map.getSource(id) as GeoJSONSource | undefined)?.loaded())) return;
+      current = false;
+      map.off('sourcedata', finish);
+      setMapError('');
+      setApplied(result ? { result, concept } : null);
+    };
+    map.on('sourcedata', finish);
+    Promise.all([
+      setData(map, 'plot', plotSource),
+      setData(map, 'road-reference', collection(reference)),
+      setData(map, 'envelope', collection(plateFeatures(result?.envelope ?? []))),
+      setData(map, 'design', collection(plateFeatures(concept?.floors ?? []))),
+      setData(map, 'planting', collection(concept?.planting ? [feature(concept.planting, {})] : [])),
+      setData(map, 'preserved-buildings', collection(pieces)),
+    ]).then(finish).catch(() => {
+      if (current) {
+        map.off('sourcedata', finish);
+        setApplied(null);
+        setMapError('The browser could not update the scenario layers.');
+      }
+    });
+    return () => {
+      current = false;
+      map.off('sourcedata', finish);
+    };
+  }, [centerline, clearedIds, concept, frontageEdgeIndex, loaded, originalBuildings, plot, result]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const map = mapRef.current;
     if (!map || !loaded) return;
     const flat = mode !== '3d';
+    const cleared = rendered ? clearedIds : [];
     const toggle = (layer: string, visible: boolean) => map.setLayoutProperty(layer, 'visibility', visible ? 'visible' : 'none');
     toggle('context-footprints', flat || footprintsOnly);
     toggle('context-massing', !flat && !footprintsOnly);
-    toggle('preserved-footprints', flat || footprintsOnly);
-    toggle('preserved-massing', !flat && !footprintsOnly);
-    toggle('design-flat', flat);
-    toggle('design-volume', !flat);
-    toggle('envelope-flat', envelopeVisible && (flat || concept !== null));
-    toggle('envelope-volume', envelopeVisible && !flat && concept === null);
-    toggle('affected-footprints', clearedIds.length > 0);
-    map.setFilter('affected-footprints', ['in', ['to-string', ['get', 'id']], ['literal', clearedIds]]);
+    toggle('preserved-footprints', cleared.length > 0 && (flat || footprintsOnly));
+    toggle('preserved-massing', cleared.length > 0 && !flat && !footprintsOnly);
+    toggle('design-flat', rendered && concept !== null && flat);
+    toggle('design-volume', rendered && concept !== null && !flat);
+    toggle('planting-ground', rendered && Boolean(concept?.planting));
+    toggle('envelope-flat', rendered && envelopeVisible && (flat || concept !== null));
+    toggle('envelope-volume', rendered && envelopeVisible && !flat && concept === null);
+    toggle('affected-footprints', cleared.length > 0);
+    map.setFilter('affected-footprints', ['in', ['to-string', ['get', 'id']], ['literal', cleared]]);
+    map.setFilter('road-reference-all', rendered ? null : ['in', ['get', 'kind'], ['literal', ['centerline', 'frontage']]]);
     for (const id of ['context-footprints', 'context-massing']) {
-      map.setFilter(id, clearedIds.length ? ['!', ['in', ['to-string', ['get', 'id']], ['literal', clearedIds]]] : null);
+      map.setFilter(id, cleared.length ? ['!', ['in', ['to-string', ['get', 'id']], ['literal', cleared]]] : null);
     }
-  }, [mode, footprintsOnly, loaded, envelopeVisible, clearedIds, concept]);
-
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map || !loaded) return;
-    if (clearedIds.length === 0) {
-      setData(map, 'preserved-buildings', empty);
-      return;
-    }
-    const originals = new Map(context.buildings.features.map(({ properties }) => [String(properties.id), properties]));
-    const pieces = (result?.preservedBuildingParts ?? []).flatMap(({ id, geometry }) => {
-      const properties = originals.get(id);
-      return properties ? [feature(geometry, properties)] : [];
-    });
-    setData(map, 'preserved-buildings', collection(pieces));
-  }, [clearedIds, context.buildings, loaded, result]);
+  }, [clearedIds, concept, envelopeVisible, footprintsOnly, loaded, mode, rendered]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -376,7 +402,15 @@ export default function AnalysisMap(props: Props) {
 
   const editing = mode === 'vertices' || mode === 'draw';
   return (
-    <section className="map-panel" data-testid="site-map" aria-label="Interactive neighborhood map">
+    <section className="map-panel"
+      data-testid="site-map"
+      data-request-id={rendered ? requestId : undefined}
+      data-result-width={rendered ? resultWidth : undefined}
+      data-concept-id={rendered ? concept?.id : undefined}
+      data-envelope-floors={rendered ? result?.envelope.length : undefined}
+      aria-label="Interactive neighborhood map"
+      aria-busy={Boolean(result) && !rendered}
+    >
       <div className="map-canvas" data-testid="map-canvas" ref={mapEl} />
       <div className="map-navigator" aria-label="Map view">
         {editing ? <>
@@ -399,12 +433,12 @@ export default function AnalysisMap(props: Props) {
       </div>
       <div className="map-legend" aria-label="Map legend">
         <span><i className="legend-key plot-key" /> Scenario parcel</span>
-        {envelopeVisible && <span><i className="legend-key envelope-key" /> {concept || mode !== '3d' ? 'Ground-level envelope' : '3D floor envelope'}</span>}
-        {concept && <span><i className="legend-key design-key" /> Selected concept</span>}
-        {concept?.planting && <span><i className="legend-key planting-key" /> Planting</span>}
+        {rendered && envelopeVisible && result?.envelope.length !== 0 && <span><i className="legend-key envelope-key" /> {concept || mode !== '3d' ? 'Ground-level envelope' : '3D floor envelope'}</span>}
+        {rendered && concept && <span><i className="legend-key design-key" /> Selected concept</span>}
+        {rendered && concept?.planting && <span><i className="legend-key planting-key" /> Planting</span>}
         <span><i className="legend-key road-key" /> Road centerline</span>
-        {result?.road && <span title="Brown is the near edge. Purple is the far edge."><i className="legend-key edge-key" /> {result.road.inferred ? 'Inferred ROW edges' : 'Surveyed ROW edges'}</span>}
-        {clearedIds.length > 0 && <span><i className="legend-key affected-key" /> Assumed removal</span>}
+        {rendered && result?.road && <span title="Brown is the near edge. Purple is the far edge."><i className="legend-key edge-key" /> {result.road.inferred ? 'Inferred ROW edges' : 'Surveyed ROW edges'}</span>}
+        {rendered && clearedIds.length > 0 && <span><i className="legend-key affected-key" /> Assumed removal</span>}
         <span><i className="legend-key coverage-key" /> Study coverage</span>
       </div>
       <div className="map-attribution">
