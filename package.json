@@ -1,0 +1,34 @@
+{
+  "name": "bangkok-plot-feasibility",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:browser": "playwright test"
+  },
+  "dependencies": {
+    "geos-wasm": "^3.1.1",
+    "lucide-react": "^0.468.0",
+    "maplibre-gl": "^5.12.0",
+    "proj4": "^2.19.10",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "terra-draw": "^1.12.0",
+    "terra-draw-maplibre-gl-adapter": "^1.2.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.1",
+    "@types/geojson": "^7946.0.16",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.1.0",
+    "typescript": "~5.9.3",
+    "vite": "^7.2.0",
+    "vitest": "^4.0.0"
+  }
+}

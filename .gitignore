@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.local-evidence/
+research/evidence/
+research/sources/
+artifacts/
+test-results/
+playwright-report/
+.DS_Store
+*.local
+.openai/local/
