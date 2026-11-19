@@ -23,7 +23,7 @@ a { color: var(--forest); }
 button, input, select, summary, a { -webkit-tap-highlight-color: transparent; }
 button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
 p, h1, h2, h3, dl, dd { margin: 0; }
-.app-shell { display: flex; flex-direction: column; min-height: 100dvh; }
+.app-shell { display: flex; flex-direction: column; height: 100dvh; }
 
 .app-header {
   background: #fafbf7;
@@ -55,8 +55,8 @@ p, h1, h2, h3, dl, dd { margin: 0; }
 .header-source:hover { background: #edf3e9; }
 
 .workspace {
-  display: grid; grid-template-columns: minmax(0, 1fr) clamp(360px, 32vw, 480px); flex: 1;
-  min-width: 0; height: calc(100dvh - 64px);
+  display: grid; grid-template-columns: minmax(0, 1fr) clamp(360px, 32vw, 480px);
+  grid-template-rows: minmax(0, 1fr); flex: 1; min-width: 0; min-height: 0;
 }
 .map-column { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 .map-panel { position: relative; flex: 1; min-height: 320px; background: #e8e7dc; isolation: isolate; }
@@ -300,8 +300,9 @@ h1 { font-size: clamp(30px, 2.7vw, 43px); line-height: 1.045; letter-spacing: -.
   .desktop-source { display: none; }
 }
 @media (max-width: 800px) {
+  .app-shell { height: auto; min-height: 100dvh; }
   .app-header { height: 55px; padding: 0 13px; }
-  .workspace { height: auto; grid-template-columns: minmax(0, 1fr); }
+  .workspace { flex: none; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto; }
   .map-panel { min-height: clamp(320px, 56dvh, 520px); }
   .map-navigator { top: 12px; left: 12px; }
   .map-controls { top: 12px; right: 12px; }

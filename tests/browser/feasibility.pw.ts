@@ -186,9 +186,17 @@ test('public-facing map loads real context and updates a scenario in place', asy
   await page.getByTestId('footprints-toggle').check();
   await expect(page.getByTestId('footprints-toggle')).toBeChecked();
   await page.getByTestId('footprints-toggle').uncheck();
+  const mapPanel = page.getByTestId('site-map');
+  const beforeRules = await mapPanel.boundingBox();
   await page.getByRole('tab', { name: 'Rules & evidence' }).click();
   await expect(page.getByText('Regulatory FAR ceiling', { exact: false })).toBeVisible();
-  await page.waitForTimeout(350);
+  const farRule = page.getByText('Floor area ratio', { exact: true });
+  await farRule.click();
+  await expect(farRule.locator('xpath=ancestor::details').getByRole('link'))
+    .toHaveAttribute('href', /download\.asa\.or\.th.*mr56-bma\.pdf/);
+  await page.getByText('Regulatory FAR ceiling', { exact: false }).scrollIntoViewIfNeeded();
+  expect(await mapPanel.boundingBox()).toEqual(beforeRules);
+  await page.waitForTimeout(500);
   await page.screenshot({ path: `artifacts/${suffix}-capacity-and-rules.png`, animations: 'disabled' });
   expect(page.url()).toBe(currentUrl);
   expect(errors).toEqual([]);

@@ -123,10 +123,13 @@ function Rules({ rules }: { rules: RuleResult[] }) {
 
 function Capacity({ result, concept }: { result: ScenarioResult | null; concept: Concept | null }) {
   const capacity = result?.capacity;
+  const heightLimit = capacity?.profileHeightLimitM === 23
+    ? 'below 23 m'
+    : `up to ${format.format(capacity?.profileHeightLimitM ?? 0)} m`;
   return <dl className="capacity-table">
     <div><dt><span className="budget-dot legal" /> Regulatory FAR ceiling <small>Base FAR {capacity?.regulatoryFar ?? '7'}:1 × eligible site</small></dt><dd>{capacity ? sqm(capacity.regulatoryGfaCeilingM2) : '—'}</dd></div>
     <div><dt><span className="budget-dot geometric" /> Geometry bound <small>Sum of permissible floor slices</small></dt><dd>{capacity ? sqm(capacity.geometricGfaUpperBoundM2) : '—'}</dd></div>
-    <div><dt><span className="budget-dot profile" /> Supported profile <small>{capacity ? `${capacity.profileMaxFloors} floors · ${format.format(capacity.profileHeightLimitM)} m height limit` : 'Application scope'}</small></dt><dd>{capacity?.profileGfaLimitM2 != null ? sqm(capacity.profileGfaLimitM2) : '—'}</dd></div>
+    <div><dt><span className="budget-dot profile" /> Supported profile <small>{capacity ? `${capacity.profileMaxFloors} floors · ${heightLimit}` : 'Application scope'}</small></dt><dd>{capacity?.profileGfaLimitM2 != null ? sqm(capacity.profileGfaLimitM2) : '—'}</dd></div>
     <div><dt><span className="budget-dot design" /> Selected design <small>Sum of generated occupied plates</small></dt><dd>{concept ? sqm(concept.gfaM2) : '—'}</dd></div>
   </dl>;
 }
