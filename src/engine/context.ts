@@ -27,7 +27,8 @@ export function prepare(scope: GeometryScope, input: ScenarioInput, plot: Polygo
   const outer = localPlot.coordinates[0];
   const edges = outer.slice(0, -1).map((start, index) => [start, outer[index + 1]]);
   const contactTolerance = 0.15;
-  const aligned = (edge: Position[]) => Math.abs(edge[1][0] - edge[0][0]) < 0.25;
+  const aligned = (edge: Position[]) =>
+    Math.abs(edge[1][0] - edge[0][0]) <= Math.max(0.25, 0.08 * Math.abs(edge[1][1] - edge[0][1]));
   const isBaselineFront = (edge: Position[]) =>
     aligned(edge) && edge.every(([x]) => Math.abs(x - frame.baseNearX) < 0.4);
   const facingEdges = edges.filter((edge, index) => input.frontageEdgeIndex === undefined
@@ -45,7 +46,6 @@ export function prepare(scope: GeometryScope, input: ScenarioInput, plot: Polygo
   const privateHandle = scope.read(privateLines);
   const boundary: MultiLineString = { type: 'MultiLineString', coordinates: localPlot.coordinates };
   const boundaryHandle = scope.read(boundary);
-  const possibleCenterlineOverlap = localBounds.minX < 0;
   const region = {
     maxX: localBounds.maxX + 100,
     minX: Math.min(localBounds.minX, frame.farX) - 100,
@@ -53,13 +53,19 @@ export function prepare(scope: GeometryScope, input: ScenarioInput, plot: Polygo
     maxY: localBounds.maxY + 100,
   };
 
-  const widthConflict = scope.temporary(() => scope.area(scope.intersection(
+  const [roadStart, roadEnd] = frame.modeledY;
+  if (roadEnd <= roadStart) throw new Error('The surveyed road edges do not overlap the selected road segment.');
+  const overlapAt = (nearEdge: number) => scope.temporary(() => scope.area(scope.intersection(
     plotHandle,
-    scope.read(box(region.minX, region.minY, frame.nearX - DISTANCE_TOLERANCE, region.maxY)),
+    scope.read(box(frame.farX, roadStart, nearEdge, roadEnd)),
   )));
-  const alignmentVerified = localBounds.minY >= frame.modeledY[0] - DISTANCE_TOLERANCE
-    && localBounds.maxY <= frame.modeledY[1] + DISTANCE_TOLERANCE;
+  const widthConflict = overlapAt(frame.nearX);
+  const conflictsWithRoad = overlapAt(frame.nearX - DISTANCE_TOLERANCE) > AREA_TOLERANCE;
+  const alignmentVerified = localBounds.minY >= roadStart - DISTANCE_TOLERANCE
+    && localBounds.maxY <= roadEnd + DISTANCE_TOLERANCE;
+  const frontageMatched = localBounds.minX < frame.baseNearX + 3;
   const affected: NonNullable<ScenarioInput['retainedBuildings']> = [];
+  const preservedBuildingParts: ScenarioResult['preservedBuildingParts'] = [];
   let retainedHandle: NativeGeometry | null = null;
   let retainedGfa: number | null = 0;
 
@@ -72,12 +78,18 @@ export function prepare(scope: GeometryScope, input: ScenarioInput, plot: Polygo
     });
     if (!overlaps) continue;
     affected.push(building);
+    const handle = scope.read(local);
+    const outside = scope.difference(handle, plotHandle);
+    const straddles = scope.area(outside) > AREA_TOLERANCE;
     if (input.redevelopment === 'retain') {
-      const clipped = scope.intersection(plotHandle, scope.read(local));
+      const clipped = scope.intersection(plotHandle, handle);
       retainedHandle = retainedHandle ? scope.union(retainedHandle, clipped) : clipped;
-      retainedGfa = retainedGfa !== null && Number.isFinite(building.grossFloorAreaM2)
-        ? retainedGfa + building.grossFloorAreaM2!
-        : null;
+      const gfa = building.eligibleGrossFloorAreaM2 ?? (straddles ? undefined : building.grossFloorAreaM2);
+      retainedGfa = retainedGfa !== null && gfa !== undefined && Number.isFinite(gfa) && gfa >= 0
+        ? retainedGfa + gfa : null;
+    } else if (building.id && straddles) {
+      const remaining = scope.write(outside);
+      if (remaining) preservedBuildingParts.push({ id: building.id, geometry: mapArea(remaining, frame.toWorld) });
     }
   }
   const road: ScenarioResult['road'] = {
@@ -91,7 +103,7 @@ export function prepare(scope: GeometryScope, input: ScenarioInput, plot: Polygo
   };
   return {
     scope, frame, input, localPlot, coverage, plotArea, plotHandle, localBounds, region, road,
-    possibleCenterlineOverlap, alignmentVerified, privateHandle, boundaryHandle, affected, retainedHandle,
+    conflictsWithRoad, alignmentVerified, frontageMatched, privateHandle, boundaryHandle, affected, preservedBuildingParts, retainedHandle,
     retainedGfa: input.redevelopment === 'retain' && !input.retainedBuildings ? null : retainedGfa,
   };
 }

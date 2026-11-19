@@ -47,15 +47,17 @@ test('production Worker projects, clips, rejects invalid geometry, and measures 
   const fixtures = [
     syntheticBase,
     { ...syntheticBase, plot: polygon([[6, 0], [20, 0], [20, 5], [30, 5], [30, 0], [44, 0], [44, 14], [30, 14], [30, 8], [20, 8], [20, 14], [6, 14]]) },
-    { ...syntheticBase, plot: polygon([[6, 0], [10, 0], [10, 24], [6, 24]]) },
+    { ...syntheticBase, plot: polygon([[6, 0], [8.8, 0], [8.8, 24], [6, 24]]) },
     { ...syntheticBase, plot: polygon([[6, 0], [52, 0], [52, 44], [6, 44]], [[23, 16], [23, 25], [34, 25], [34, 16]]) },
     { ...syntheticBase, plot: polygon([[6, 0], [34, 26], [6, 26], [34, 0]]) },
     preset,
+    { ...preset, road: { ...preset.road, widthM: 6, widthSource: 'user-override' as const } },
+    { ...preset, road: { ...preset.road, widthM: 2, widthSource: 'user-override' as const } },
+    { ...preset, road: { ...preset.road, widthM: 14.7, widthSource: 'user-override' as const } },
   ];
-  const network: string[] = [];
-  page.on('response', (response) => {
-    if (response.ok() && response.url().includes('.wasm')) network.push(response.url());
-  });
+  const workerAsset = await page.request.get(`/assets/${workerFile}`);
+  expect(workerAsset.ok()).toBe(true);
+  expect(await workerAsset.text()).toContain('WebAssembly');
   // Navigate to a simple same-origin asset so only the measured Worker is running.
   await page.goto('/data/manifest.json');
   const { outputs, samples, coldMs } = await page.evaluate(async ({ path, fixtures, preset }) => {
@@ -102,7 +104,13 @@ test('production Worker projects, clips, rejects invalid geometry, and measures 
   expect(results[4].validation).toBe('invalid');
   expect(results[5].plotAreaM2).toBeCloseTo(828, 2);
   expect(results[5].concepts).toHaveLength(2);
-  expect(network.length).toBeGreaterThan(0);
+  expect(results[6].plotAreaM2).toBeCloseTo(results[5].plotAreaM2, 4);
+  expect(results[6].capacity?.geometricGfaUpperBoundM2).toBeCloseTo(results[5].capacity!.geometricGfaUpperBoundM2, 3);
+  expect(results[7].plotAreaM2).toBeCloseTo(results[5].plotAreaM2, 4);
+  expect(results[7].capacity?.geometricGfaUpperBoundM2).toBeLessThan(results[5].capacity!.geometricGfaUpperBoundM2);
+  expect(results[7].rules.find(({ id }) => id === 'height-plane')?.controls).toBe(true);
+  expect(results[8].plotAreaM2).toBeCloseTo(results[5].plotAreaM2, 4);
+  expect(results[8].validation).toBe('road-conflict');
   const percentile = (values: number[], p: number) => values.sort((a, b) => a - b)[Math.ceil(p * values.length) - 1];
   const stats = {
     coldMs,
@@ -127,6 +135,8 @@ test('public-facing map loads real context and updates a scenario in place', asy
   const result = page.getByTestId('result-ready');
   await expect(result).toHaveAttribute('data-state', 'valid');
   await expect(page.getByTestId('site-map').locator('canvas.maplibregl-canvas')).toBeVisible();
+  await expect(page.getByTestId('view-plan')).toBeEnabled();
+  console.log(`Initial scenario and map ready ${Math.round(await page.evaluate(() => performance.now()))} ms after navigation`);
   await expect(page.getByTestId('concept-wide')).toBeVisible();
   await expect(page.getByTestId('concept-stepped')).toBeVisible();
   for (const pathname of ['/data/site.json', '/data/buildings.geojson', '/data/roads.geojson']) {
@@ -148,11 +158,38 @@ test('public-facing map loads real context and updates a scenario in place', asy
   await page.getByTestId('reset-scenario').click();
   await expect(result).toHaveAttribute('data-state', 'valid');
   await page.getByTestId('concept-stepped').click();
+  await page.waitForTimeout(400);
+  await page.screenshot({ path: `artifacts/${suffix}-stepped-3d.png`, animations: 'disabled' });
   await page.getByTestId('view-plan').click();
   await page.waitForTimeout(400);
   await page.screenshot({ path: `artifacts/${suffix}-stepped-plan.png`, animations: 'disabled' });
+
+  const parcelMetric = page.getByRole('complementary', { name: 'Scenario analysis' })
+    .getByText('Scenario parcel', { exact: true }).locator('..');
+  const baseline = await parcelMetric.innerText();
+  await page.getByTestId('edit-plot').click();
+  await page.getByRole('button', { name: 'Draw new' }).click();
+  await page.waitForTimeout(350);
+  const mapBounds = await page.getByTestId('site-map').locator('canvas.maplibregl-canvas').boundingBox();
+  expect(mapBounds).toBeTruthy();
+  const drawPoints = [[0.43, 0.47], [0.525, 0.47], [0.527, 0.54], [0.46, 0.53], [0.43, 0.54], [0.43, 0.47]];
+  for (const [x, y] of drawPoints) {
+    await page.mouse.click(mapBounds!.x + mapBounds!.width * x, mapBounds!.y + mapBounds!.height * y);
+    await page.waitForTimeout(100);
+  }
+  await expect(parcelMetric).not.toHaveText(baseline);
+  await expect(result, 'new plot adjoining the modeled road').toHaveAttribute('data-state', 'valid');
+  await page.getByTestId('reset-scenario').click();
+  await expect(result).toHaveAttribute('data-state', 'valid');
   await page.getByTestId('view-3d').click();
   await expect(page.getByTestId('site-map').locator('canvas.maplibregl-canvas')).toBeVisible();
+  await page.getByTestId('footprints-toggle').check();
+  await expect(page.getByTestId('footprints-toggle')).toBeChecked();
+  await page.getByTestId('footprints-toggle').uncheck();
+  await page.getByRole('tab', { name: 'Rules & evidence' }).click();
+  await expect(page.getByText('Regulatory FAR ceiling', { exact: false })).toBeVisible();
+  await page.waitForTimeout(350);
+  await page.screenshot({ path: `artifacts/${suffix}-capacity-and-rules.png`, animations: 'disabled' });
   expect(page.url()).toBe(currentUrl);
   expect(errors).toEqual([]);
 });

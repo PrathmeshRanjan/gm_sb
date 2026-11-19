@@ -1,0 +1,12 @@
+The geometry Web Worker uses geos-wasm 3.1.1 with GEOS 3.13.0.
+
+geos-wasm package and license information:
+https://www.npmjs.com/package/geos-wasm/v/3.1.1
+Corresponding wrapper source and build instructions:
+https://github.com/chrispahm/geos-wasm/tree/82e49f9ba1849a004bf31fc1c1be2ff918889586
+Corresponding GEOS source:
+https://download.osgeo.org/geos/geos-3.13.0.tar.bz2
+
+See geos-wasm-license.txt for the notices shipped with the geometry package.
+See third-party-licenses.md for the browser bundle’s software notices.
+See data/manifest.json for neighborhood dataset attribution and licenses.

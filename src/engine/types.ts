@@ -23,7 +23,12 @@ export interface ScenarioInput {
   road: ScenarioRoad;
   redevelopment: 'clear' | 'retain';
   frontageEdgeIndex?: number;
-  retainedBuildings?: { id?: string; footprint: AreaGeometry; grossFloorAreaM2?: number }[];
+  retainedBuildings?: {
+    id?: string;
+    footprint: AreaGeometry;
+    grossFloorAreaM2?: number;
+    eligibleGrossFloorAreaM2?: number;
+  }[];
 }
 
 export interface RuleResult {
@@ -65,6 +70,7 @@ export interface ScenarioResult {
   plotAreaM2: number;
   coverageVerified: boolean;
   affectedBuildingIds: string[];
+  preservedBuildingParts: { id: string; geometry: AreaGeometry }[];
   road: {
     centerline: LineString;
     nearEdge: LineString;

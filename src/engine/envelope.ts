@@ -16,7 +16,9 @@ export function fromRoadReference(ctx: Prepared, limit: RoadLimit) {
   return limit.distance + (limit.reference === 'near-edge' ? ctx.frame.nearX : 0);
 }
 
-export function floorEnvelopes(ctx: Prepared, floorCount: number, categoryGfa: number) {
+export function floorEnvelopes(
+  ctx: Prepared, floorCount: number, categoryGfa: number, measureControls = false,
+) {
   const { scope, plotHandle, privateHandle, retainedHandle, input, frame } = ctx;
   const profile = PROFILES[input.profile];
   const totalHeightM = floorCount * profile.floorHeight;
@@ -24,34 +26,18 @@ export function floorEnvelopes(ctx: Prepared, floorCount: number, categoryGfa: n
   const front = frontLimits(frame.widthM, floorCount, totalHeightM, categoryGfa);
   const restrictions = {
     clearance: false, nationalFront: false, localFront: false,
-    nationalBoundary: false, localBoundary: false, roadHeight: false, retained: false,
+    nationalBoundary: false, localBoundary: false, roadHeight: false,
   };
-  let base = plotHandle;
-
-  function apply(previous: NativeGeometry, next: NativeGeometry, restriction: keyof typeof restrictions) {
-    if (scope.area(previous) - scope.area(next) > 0.005) restrictions[restriction] = true;
-    return next;
-  }
-
-  if (perimeter) base = apply(base, scope.buffer(base, -perimeter), 'clearance');
-  if (retainedHandle) {
-    base = apply(base, scope.difference(base, scope.buffer(retainedHandle, 6)), 'retained');
-  }
-
-  base = clipRoadSide(ctx, base, frame.nearX);
+  const retainedBuffer = retainedHandle ? scope.buffer(retainedHandle, 6) : null;
+  const site = retainedBuffer ? scope.difference(plotHandle, retainedBuffer) : plotHandle;
+  const allAround = perimeter ? scope.buffer(plotHandle, -perimeter) : null;
+  const base = allAround ? scope.intersection(site, allAround) : site;
   const nationalFrontX = fromRoadReference(ctx, front.national);
   const localFrontX = fromRoadReference(ctx, front.local);
-  const drivingFrontX = Math.max(nationalFrontX, localFrontX);
-  if (drivingFrontX > frame.nearX) {
-    const cut = clipRoadSide(ctx, base, drivingFrontX);
-    const reduced = scope.area(base) - scope.area(cut) > 0.005;
-    restrictions.nationalFront = reduced && nationalFrontX === drivingFrontX;
-    restrictions.localFront = reduced && localFrontX === drivingFrontX;
-    base = cut;
-  }
-
+  const drivingFrontX = Math.max(nationalFrontX, localFrontX, frame.nearX);
   const privateBands = new Map<number, NativeGeometry>();
   const floors: NativeFloor[] = [];
+
   for (let floor = 1; floor <= floorCount; floor++) {
     const topM = floor * profile.floorHeight;
     const baseM = (floor - 1) * profile.floorHeight;
@@ -63,15 +49,30 @@ export function floorEnvelopes(ctx: Prepared, floorCount: number, categoryGfa: n
       privateBands.set(drivingDistance, privateBand);
     }
     const afterBoundary = scope.difference(base, privateBand);
-    const reduced = scope.area(base) - scope.area(afterBoundary) > 0.005;
-    restrictions.nationalBoundary ||= reduced && privateDistances.national === drivingDistance;
-    restrictions.localBoundary ||= reduced && privateDistances.local === drivingDistance;
-    const geometry = apply(
-      afterBoundary,
-      clipRoadSide(ctx, afterBoundary, frame.farX + topM / 2),
-      'roadHeight',
-    );
+    const roadHeightX = frame.farX + topM / 2;
+    const roadX = Math.max(drivingFrontX, roadHeightX);
+    const geometry = clipRoadSide(ctx, afterBoundary, roadX);
     floors.push({ floor, baseM, topM, geometry });
+
+    if (measureControls) {
+      scope.temporary(() => {
+        const finalArea = scope.area(geometry);
+        const matters = (alternative: NativeGeometry) => scope.area(alternative) > finalArea + 0.005;
+        if (matters(clipRoadSide(ctx, base, roadX))) {
+          restrictions.nationalBoundary ||= privateDistances.national === drivingDistance;
+          restrictions.localBoundary ||= privateDistances.local === drivingDistance;
+        }
+        if (allAround) restrictions.clearance ||= matters(clipRoadSide(ctx, scope.difference(site, privateBand), roadX));
+        if (roadHeightX >= drivingFrontX) {
+          restrictions.roadHeight ||= matters(clipRoadSide(ctx, afterBoundary, drivingFrontX));
+        }
+        if (drivingFrontX >= roadHeightX && drivingFrontX > frame.nearX
+            && matters(clipRoadSide(ctx, afterBoundary, Math.max(roadHeightX, frame.nearX)))) {
+          restrictions.nationalFront ||= nationalFrontX === drivingFrontX;
+          restrictions.localFront ||= localFrontX === drivingFrontX;
+        }
+      });
+    }
   }
   return { floors, restrictions };
 }

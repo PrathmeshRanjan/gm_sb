@@ -9,7 +9,7 @@ export type NativeGeometry = number;
 let initialization: Promise<Geos> | undefined;
 
 export async function withGeos<T>(callback: (scope: GeometryScope) => T): Promise<T> {
-  initialization ??= initGeos();
+  initialization ??= initGeos({ noticeHandler: () => undefined });
   const geos = await initialization;
   const scope = new GeometryScope(geos);
   try {
@@ -54,7 +54,7 @@ export class GeometryScope {
 
   write(geometry: NativeGeometry): AreaGeometry | null {
     if (this.geos.GEOSisEmpty(geometry) === 1) return null;
-    const output = geosGeomToGeojson(geometry, this.geos);
+    const output = geosGeomToGeojson(geometry, this.geos) as Geometry;
     if (output.type === 'Polygon' || output.type === 'MultiPolygon') return output;
     if (output.type !== 'GeometryCollection') return null;
     const coordinates = output.geometries.flatMap((item) => {

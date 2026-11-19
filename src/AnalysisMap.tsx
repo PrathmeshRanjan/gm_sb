@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import maplibregl, { type GeoJSONSource, type Map as MapInstance, type StyleSpecification } from 'maplibre-gl';
+import maplibregl, { type FillExtrusionLayerSpecification, type FillLayerSpecification, type GeoJSONSource, type Map as MapInstance, type StyleSpecification } from 'maplibre-gl';
 import { TerraDraw, TerraDrawPolygonMode, TerraDrawSelectMode } from 'terra-draw';
 import { TerraDrawMapLibreGLAdapter } from 'terra-draw-maplibre-gl-adapter';
 import { Box, Check, Compass, Layers2, LocateFixed, Minus, PencilLine, Plus } from 'lucide-react';
@@ -18,6 +18,7 @@ interface Props {
   result: ScenarioResult | null;
   concept: Concept | null;
   centerline: LineString;
+  roadName: string;
   frontageEdgeIndex?: number;
   footprintsOnly: boolean;
   envelopeVisible: boolean;
@@ -45,23 +46,34 @@ function setData(map: MapInstance, name: string, data: FeatureCollection) {
   (map.getSource(name) as GeoJSONSource | undefined)?.setData(data);
 }
 
+const buildingFootprintPaint = {
+  'fill-color': '#b8b5a6',
+  'fill-opacity': 0.67,
+  'fill-outline-color': '#a19f91',
+} satisfies FillLayerSpecification['paint'];
+
+const buildingMassingPaint = {
+  'fill-extrusion-height': ['coalesce', ['get', 'height'], 5],
+  'fill-extrusion-color': ['match', ['get', 'heightKind'], 'sourced', '#b6b7a8', 'estimate', '#bcbaa9', '#d2cfc0'],
+  'fill-extrusion-opacity': 0.94,
+} satisfies FillExtrusionLayerSpecification['paint'];
+
 function addLayers(map: MapInstance, data: ContextData) {
   map.addSource('coverage', { type: 'geojson', data: collection([feature(data.site.coverage, {})]) });
   map.addSource('roads', { type: 'geojson', data: data.roads });
   map.addSource('buildings', { type: 'geojson', data: data.buildings });
-  for (const id of ['plot', 'road-reference', 'envelope', 'design', 'planting']) {
+  for (const id of ['plot', 'road-reference', 'envelope', 'design', 'planting', 'preserved-buildings']) {
     map.addSource(id, { type: 'geojson', data: empty });
   }
 
   map.addLayer({ id: 'study-fill', type: 'fill', source: 'coverage', paint: { 'fill-color': '#f0eee4', 'fill-opacity': 0.53 } });
-  const roadWidth = ['interpolate', ['linear'], ['zoom'], 14, 1.1, 17, 5, 20, 28] as const;
   map.addLayer({
     id: 'street-case', type: 'line', source: 'roads', layout: { 'line-join': 'round', 'line-cap': 'round' },
-    paint: { 'line-color': '#d2cfc0', 'line-width': ['+', [...roadWidth], 1.5] },
+    paint: { 'line-color': '#d2cfc0', 'line-width': ['interpolate', ['linear'], ['zoom'], 14, 2.6, 17, 6.5, 20, 29.5] },
   });
   map.addLayer({
     id: 'street', type: 'line', source: 'roads', layout: { 'line-join': 'round', 'line-cap': 'round' },
-    paint: { 'line-color': '#faf8f0', 'line-width': [...roadWidth] },
+    paint: { 'line-color': '#faf8f0', 'line-width': ['interpolate', ['linear'], ['zoom'], 14, 1.1, 17, 5, 20, 28] },
   });
   map.addLayer({
     id: 'study-boundary', type: 'line', source: 'coverage',
@@ -70,7 +82,7 @@ function addLayers(map: MapInstance, data: ContextData) {
   map.addLayer({
     id: 'road-reference-all', type: 'line', source: 'road-reference', layout: { 'line-cap': 'round' },
     paint: {
-      'line-color': ['match', ['get', 'kind'], 'centerline', '#a75c2b', 'frontage', '#164d3c', 'near', '#b27746', '#b27746'],
+      'line-color': ['match', ['get', 'kind'], 'centerline', '#a75c2b', 'frontage', '#164d3c', 'near', '#a4754f', '#837194'],
       'line-width': ['match', ['get', 'kind'], 'centerline', 2.5, 'frontage', 4, 1.35],
       'line-dasharray': [3, 3],
     },
@@ -81,15 +93,23 @@ function addLayers(map: MapInstance, data: ContextData) {
   });
   map.addLayer({
     id: 'context-footprints', type: 'fill', source: 'buildings',
-    paint: { 'fill-color': '#b8b5a6', 'fill-opacity': 0.67, 'fill-outline-color': '#a19f91' },
+    paint: buildingFootprintPaint,
+  });
+  map.addLayer({
+    id: 'affected-footprints', type: 'line', source: 'buildings', layout: { visibility: 'none' },
+    paint: { 'line-color': '#7a7363', 'line-width': 1.25, 'line-opacity': 0.7, 'line-dasharray': [2, 2] },
   });
   map.addLayer({
     id: 'context-massing', type: 'fill-extrusion', source: 'buildings',
-    paint: {
-      'fill-extrusion-height': ['coalesce', ['get', 'height'], 5],
-      'fill-extrusion-color': ['match', ['get', 'heightKind'], 'sourced', '#b6b7a8', 'estimate', '#bcbaa9', '#d2cfc0'],
-      'fill-extrusion-opacity': 0.94,
-    },
+    paint: buildingMassingPaint,
+  });
+  map.addLayer({
+    id: 'preserved-footprints', type: 'fill', source: 'preserved-buildings',
+    paint: buildingFootprintPaint,
+  });
+  map.addLayer({
+    id: 'preserved-massing', type: 'fill-extrusion', source: 'preserved-buildings',
+    paint: buildingMassingPaint,
   });
   map.addLayer({
     id: 'scenario-outline', type: 'line', source: 'plot',
@@ -133,11 +153,12 @@ function addLayers(map: MapInstance, data: ContextData) {
 }
 
 export default function AnalysisMap(props: Props) {
-  const { context, plot, mode, result, concept, centerline, frontageEdgeIndex, footprintsOnly, envelopeVisible, clearedIds } = props;
+  const { context, plot, mode, result, concept, centerline, roadName, frontageEdgeIndex, footprintsOnly, envelopeVisible, clearedIds } = props;
   const mapEl = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapInstance | null>(null);
   const drawRef = useRef<TerraDraw | null>(null);
   const activeDrawId = useRef<string | number | null>(null);
+  const lastEditedPlot = useRef('');
   const latest = useRef(props);
   const lastCamera = useRef<{ zoom: number; center: maplibregl.LngLat; bearing: number; pitch: number } | null>(null);
   const previousMode = useRef<MapMode>('3d');
@@ -182,7 +203,7 @@ export default function AnalysisMap(props: Props) {
             flags: { polygon: { feature: { coordinates: { draggable: true, deletable: true, midpoints: { draggable: true } } } } },
             styles: {
               selectedPolygonColor: '#6bbb97',
-              selectedPolygonOpacity: 0.17,
+              selectedPolygonFillOpacity: 0.17,
               selectedPolygonOutlineColor: '#0b654c',
               selectedPolygonOutlineWidth: 2.5,
               selectionPointColor: '#0b654c',
@@ -199,9 +220,11 @@ export default function AnalysisMap(props: Props) {
       draw.on('change', () => {
         if (latest.current.mode !== 'vertices' || activeDrawId.current == null) return;
         const updated = draw.getSnapshotFeature(activeDrawId.current)?.geometry;
-        if (updated?.type === 'Polygon' && JSON.stringify(updated) !== JSON.stringify(latest.current.plot)) {
-          latest.current.onPlot(updated);
-        }
+        if (updated?.type !== 'Polygon') return;
+        const serialized = JSON.stringify(updated);
+        if (serialized === lastEditedPlot.current) return;
+        lastEditedPlot.current = serialized;
+        latest.current.onPlot(updated);
       });
       draw.on('finish', (id) => {
         if (latest.current.mode !== 'draw') return;
@@ -249,10 +272,16 @@ export default function AnalysisMap(props: Props) {
     draw.setMode('static');
     draw.clear();
     if (mode === 'vertices') {
-      const geometry = latest.current.plot;
+      const geometry: Polygon = {
+        type: 'Polygon',
+        coordinates: latest.current.plot.coordinates.map((ring) =>
+          ring.map((point) => point.map((value) => Number(value.toFixed(9)))),
+        ),
+      };
       const [added] = draw.addFeatures([feature(geometry, { mode: 'polygon' })]);
-      if (added?.valid) {
+      if (added?.valid && added.id !== undefined) {
         activeDrawId.current = added.id;
+        lastEditedPlot.current = JSON.stringify(geometry);
         draw.setMode('select');
         draw.selectFeature(added.id);
       } else {
@@ -292,14 +321,48 @@ export default function AnalysisMap(props: Props) {
     const toggle = (layer: string, visible: boolean) => map.setLayoutProperty(layer, 'visibility', visible ? 'visible' : 'none');
     toggle('context-footprints', flat || footprintsOnly);
     toggle('context-massing', !flat && !footprintsOnly);
+    toggle('preserved-footprints', flat || footprintsOnly);
+    toggle('preserved-massing', !flat && !footprintsOnly);
     toggle('design-flat', flat);
     toggle('design-volume', !flat);
-    toggle('envelope-flat', flat && envelopeVisible);
-    toggle('envelope-volume', !flat && envelopeVisible);
+    toggle('envelope-flat', envelopeVisible && (flat || concept !== null));
+    toggle('envelope-volume', envelopeVisible && !flat && concept === null);
+    toggle('affected-footprints', clearedIds.length > 0);
+    map.setFilter('affected-footprints', ['in', ['to-string', ['get', 'id']], ['literal', clearedIds]]);
     for (const id of ['context-footprints', 'context-massing']) {
       map.setFilter(id, clearedIds.length ? ['!', ['in', ['to-string', ['get', 'id']], ['literal', clearedIds]]] : null);
     }
-  }, [mode, footprintsOnly, loaded, envelopeVisible, clearedIds]);
+  }, [mode, footprintsOnly, loaded, envelopeVisible, clearedIds, concept]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !loaded) return;
+    if (clearedIds.length === 0) {
+      setData(map, 'preserved-buildings', empty);
+      return;
+    }
+    const originals = new Map(context.buildings.features.map(({ properties }) => [String(properties.id), properties]));
+    const pieces = (result?.preservedBuildingParts ?? []).flatMap(({ id, geometry }) => {
+      const properties = originals.get(id);
+      return properties ? [feature(geometry, properties)] : [];
+    });
+    setData(map, 'preserved-buildings', collection(pieces));
+  }, [clearedIds, context.buildings, loaded, result]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !loaded) return;
+    const first = centerline.coordinates[0];
+    const end = centerline.coordinates.at(-1);
+    if (!first || !end) return;
+    const element = document.createElement('span');
+    element.className = 'road-map-label';
+    element.textContent = roadName;
+    const label = new maplibregl.Marker({ element, offset: [13, -5], anchor: 'left' })
+      .setLngLat([first[0] * 0.12 + end[0] * 0.88, first[1] * 0.12 + end[1] * 0.88])
+      .addTo(map);
+    return () => { label.remove(); };
+  }, [centerline, loaded, roadName]);
 
   function showCoverage() {
     const map = mapRef.current;
@@ -313,16 +376,16 @@ export default function AnalysisMap(props: Props) {
 
   const editing = mode === 'vertices' || mode === 'draw';
   return (
-    <section className="map-panel" aria-label="Interactive neighborhood map">
-      <div className="map-canvas" ref={mapEl} />
+    <section className="map-panel" data-testid="site-map" aria-label="Interactive neighborhood map">
+      <div className="map-canvas" data-testid="map-canvas" ref={mapEl} />
       <div className="map-navigator" aria-label="Map view">
         {editing ? <>
           <button type="button" className={mode === 'vertices' ? 'active' : ''} onClick={() => props.onMode('vertices')} disabled={!loaded}><PencilLine size={16} /> Move vertices</button>
           <button type="button" className={mode === 'draw' ? 'active' : ''} onClick={() => props.onMode('draw')} disabled={!loaded}><Plus size={16} /> Draw new</button>
           <button type="button" className="map-done" onClick={() => props.onMode('3d')} disabled={!loaded}><Check size={16} /> Done</button>
         </> : <>
-          <button type="button" className={mode === '3d' ? 'active' : ''} onClick={() => props.onMode('3d')} disabled={!loaded} aria-pressed={mode === '3d'}><Box size={16} /> 3D view</button>
-          <button type="button" className={mode === 'plan' ? 'active' : ''} onClick={() => props.onMode('plan')} disabled={!loaded} aria-pressed={mode === 'plan'}><Layers2 size={16} /> Plan</button>
+          <button type="button" data-testid="view-3d" className={mode === '3d' ? 'active' : ''} onClick={() => props.onMode('3d')} disabled={!loaded} aria-pressed={mode === '3d'}><Box size={16} /> 3D view</button>
+          <button type="button" data-testid="view-plan" className={mode === 'plan' ? 'active' : ''} onClick={() => props.onMode('plan')} disabled={!loaded} aria-pressed={mode === 'plan'}><Layers2 size={16} /> Plan</button>
         </>}
       </div>
       {editing && <div className="map-hint" role="status">{editError || (mode === 'draw' ? 'Click to add corners. Click the first corner to finish.' : 'Drag a corner to edit. Drag a midpoint to add a vertex.')}</div>}
@@ -336,10 +399,12 @@ export default function AnalysisMap(props: Props) {
       </div>
       <div className="map-legend" aria-label="Map legend">
         <span><i className="legend-key plot-key" /> Scenario parcel</span>
-        {envelopeVisible && <span><i className="legend-key envelope-key" /> Floor envelopes</span>}
+        {envelopeVisible && <span><i className="legend-key envelope-key" /> {concept || mode !== '3d' ? 'Ground-level envelope' : '3D floor envelope'}</span>}
         {concept && <span><i className="legend-key design-key" /> Selected concept</span>}
         {concept?.planting && <span><i className="legend-key planting-key" /> Planting</span>}
-        <span><i className="legend-key road-key" /> Road references</span>
+        <span><i className="legend-key road-key" /> Road centerline</span>
+        {result?.road && <span title="Brown is the near edge. Purple is the far edge."><i className="legend-key edge-key" /> {result.road.inferred ? 'Inferred ROW edges' : 'Surveyed ROW edges'}</span>}
+        {clearedIds.length > 0 && <span><i className="legend-key affected-key" /> Assumed removal</span>}
         <span><i className="legend-key coverage-key" /> Study coverage</span>
       </div>
       <div className="map-attribution">
