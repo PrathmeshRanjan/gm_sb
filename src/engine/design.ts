@@ -101,11 +101,13 @@ function plantingGeometry(ctx: Prepared, ground: NativeFloor) {
   return scope.intersection(open, scope.read(box(region.minX, low, region.maxX, region.maxY)));
 }
 
-function proposal(ctx: Prepared, strategy: Strategy, candidate: RatedDesign, other?: Concept): Concept | null {
+function proposal(ctx: Prepared, strategy: Strategy, candidate: RatedDesign, other?: Concept): { concept: Concept | null; frontageFailure: boolean } {
   const { scope, input } = ctx;
   const planting = plantingGeometry(ctx, candidate.floors[0]);
   const audit = checkConcept(ctx, candidate.floors, planting);
-  if (audit.checks.some((check) => check.status === 'fail')) return null;
+  if (audit.checks.some((check) => check.status === 'fail')) return {
+    concept: null, frontageFailure: audit.checks.some(({ id, status }) => id === 'frontage' && status === 'fail'),
+  };
   const geometryForPlanting = planting ? scope.write(planting) : null;
   const tightChecks = audit.checks.filter(({ controls }) => controls).map(({ label }) => label);
   const limitingFactors = tightChecks.length
@@ -118,9 +120,10 @@ function proposal(ctx: Prepared, strategy: Strategy, candidate: RatedDesign, oth
   }
   limitingFactors.push(`Smallest plate ${sqm(Math.min(...audit.areas))}. Search uses a ${profile.minArea} m² plate and ${profile.minDepth} m usable-core heuristic.`);
 
-  return {
+  return { frontageFailure: false, concept: {
     id: strategy,
-    name: CONFIG[strategy].name,
+    name: strategy === 'stepped' && Math.max(...audit.areas) - Math.min(...audit.areas) < 0.01
+      ? 'Compact garden form' : CONFIG[strategy].name,
     floors: candidate.floors.map(({ floor, baseM, topM, geometry }, i) => ({
       floor, baseM, topM, areaM2: audit.areas[i], geometry: worldGeometry(ctx, scope.write(geometry)!),
     })),
@@ -139,85 +142,119 @@ function proposal(ctx: Prepared, strategy: Strategy, candidate: RatedDesign, oth
       ? `${sqm(Math.abs(other.gfaM2 - audit.gfa))} ${audit.gfa <= other.gfaM2 ? 'less' : 'more'} GFA and ${sqm(audit.openArea - other.openM2)} more open space than the wider/lower concept.`
       : `${sqm(audit.coveredArea)} covered projection leaves ${sqm(audit.openArea)} uncovered. Compare with the smaller footprint when both forms fit.`,
     limitingFactors,
-  };
+  } };
 }
 
 const descendingGfa = (a: RatedDesign, b: RatedDesign) => b.gfaM2 - a.gfaM2 || a.footprintM2 - b.footprintM2;
 const byFootprint = (a: RatedDesign, b: RatedDesign) => a.footprintM2 - b.footprintM2 || descendingGfa(a, b);
 
-export function generateDesign(ctx: Prepared, strategy: Strategy, other?: Concept) {
+export function generateDesign(ctx: Prepared, strategy: Strategy, other?: Concept): {
+  concept: Concept | null;
+  evaluated: number;
+  independentlyChecked: number;
+  validated: number;
+  bestValidatedGfaM2: number | null;
+  frontageFailures: number;
+} {
   const { scope, input } = ctx;
   const profile = PROFILES[input.profile];
   const floorMax = Math.min(CONFIG[strategy].maxFloors, profile.maxFloors);
   const counts = Array.from({ length: floorMax }, (_, i) => floorMax - i).filter((n) =>
     n >= (input.profile === 'multifamily' || strategy === 'stepped' ? 2 : 1));
-  const screened: RatedDesign[] = [];
   const maximumWithoutRetained = Math.max(0, FAR * ctx.plotArea - (ctx.retainedGfa ?? 0));
   const categoryCap = Math.min(profile.gfaLimit ?? Infinity, maximumWithoutRetained);
   let evaluated = 0;
 
-  for (const count of counts) {
-    // The §55 small-house exemption is tested only in its eligible area band.
-    const bandCaps = input.profile === 'house' ? [300, Math.min(2000, categoryCap)] : [categoryCap];
-    for (const bandCap of new Set(bandCaps.map((value) => Math.min(value, categoryCap)))) {
-      const { floors: envelopes } = floorEnvelopes(ctx, count, bandCap);
-      const ground = scope.largestPolygon(envelopes[0].geometry);
-      if (!ground || scope.area(envelopes.at(-1)!.geometry) < profile.minArea) continue;
-      const groundArea = scope.area(envelopes[0].geometry);
-      const perFloorTarget = bandCap / (count * (strategy === 'stepped' ? 0.87 : 1));
-      const maxFootprint = Math.min(groundArea, ctx.plotArea * 0.7, other ? other.floors[0].areaM2 * 0.85 : Infinity);
-      const target = Math.min(perFloorTarget, maxFootprint);
-      if (target < profile.minArea) continue;
-      const patterns: StepPattern[] = strategy === 'stepped'
-        ? [count < 5 ? { label: 'upper plate stepped', fromFloor: count, every: 2, fraction: 0.15 } : STEPS[0], STEPS[1]]
-        : [null];
-      const seeds: { geometry: NativeGeometry; label: string }[] = [];
-      const fractions = [0.79, 0.96, 1.04, 1.14];
-      const angles = [-18, 0, 18];
-      for (const fraction of fractions) {
-        for (const angle of angles) {
-          const { rectangle, notch } = designMask(ground, target * fraction, strategy, angle, angle === 0 ? 0 : 1.5);
-          const body = scope.read(rectangle);
-          seeds.push({ geometry: notch ? scope.difference(body, scope.read(notch)) : body,
-            label: `${angle}° ${notch ? 'courtyard wing' : 'bar'}` });
+  function collect(fallback: boolean) {
+    const screened: RatedDesign[] = [];
+    for (const count of counts) {
+      // The §55 small-house exemption is tested only in its eligible area band.
+      const bandCaps = input.profile === 'house' ? [300, Math.min(2000, categoryCap)] : [categoryCap];
+      for (const bandCap of new Set(bandCaps.map((value) => Math.min(value, categoryCap)))) {
+        const { floors: envelopes } = floorEnvelopes(ctx, count, bandCap);
+        const ground = scope.largestPolygon(envelopes[0].geometry);
+        if (!ground || scope.area(envelopes.at(-1)!.geometry) < profile.minArea) continue;
+        const groundArea = scope.area(envelopes[0].geometry);
+        const perFloorTarget = bandCap / (count * (strategy === 'stepped' ? 0.87 : 1));
+        const maxFootprint = Math.min(groundArea, ctx.plotArea * 0.7, other ? other.floors[0].areaM2 * 0.85 : Infinity);
+        const target = Math.min(perFloorTarget, maxFootprint);
+        if (target < profile.minArea) continue;
+        const patterns: StepPattern[] = fallback ? [null] : strategy === 'stepped'
+          ? [count < 5 ? { label: 'upper plate stepped', fromFloor: count, every: 2, fraction: 0.15 } : STEPS[0], STEPS[1]]
+          : [null];
+        const seeds: { geometry: NativeGeometry; label: string }[] = [];
+        const bounds = extent(points(ground));
+        if (fallback) {
+          // Preserve the shorter dimension of a narrow envelope so a seed
+          // has room for the usable core. Also vary its long-axis position.
+          const x = bounds.maxX - bounds.minX;
+          const y = bounds.maxY - bounds.minY;
+          for (const fraction of [0.8, 0.9, 0.98, 1.12]) {
+            const span = Math.min(1, target * fraction / groundArea);
+            for (const shift of [0, 0.5, 1]) {
+              const offset = (1 - span) * shift;
+              const clip = y >= x
+                ? box(bounds.minX - 1, bounds.minY + offset * y, bounds.maxX + 1, bounds.minY + (offset + span) * y)
+                : box(bounds.minX + offset * x, bounds.minY - 1, bounds.minX + (offset + span) * x, bounds.maxY + 1);
+              seeds.push({ geometry: scope.read(clip), label: 'compact parcel-derived strip' });
+            }
+          }
+        } else {
+          const fractions = [0.79, 0.96, 1.04, 1.14];
+          const angles = [-18, 0, 18];
+          for (const fraction of fractions) {
+            for (const angle of angles) {
+              const { rectangle, notch } = designMask(ground, target * fraction, strategy, angle, angle === 0 ? 0 : 1.5);
+              const body = scope.read(rectangle);
+              seeds.push({ geometry: notch ? scope.difference(body, scope.read(notch)) : body,
+                label: `${angle}° ${notch ? 'courtyard wing' : 'bar'}` });
+            }
+          }
+          // Directly clip the envelope where the useful silhouette is irregular.
+          for (const strip of [0, 0.12, 0.22, 0.32, 0.42]) {
+            seeds.push({
+              geometry: clipRoadSide(ctx, envelopes[0].geometry, bounds.minX + strip * (bounds.maxX - bounds.minX)),
+              label: 'parcel-derived wing',
+            });
+          }
+        }
+        for (const seed of seeds) for (const steps of patterns) {
+          evaluated++;
+          const floors = floorSequence(ctx, envelopes, seed.geometry, steps);
+          if (!floors) continue;
+          const gfaM2 = floors.reduce((sum, floor) => sum + scope.area(floor.geometry), 0);
+          const footprintM2 = scope.area(floors[0].geometry);
+          if (!planningBudget(ctx, gfaM2, footprintM2, bandCap) || footprintM2 > maxFootprint) continue;
+          screened.push({ floors, gfaM2, footprintM2,
+            family: steps && count >= steps.fromFloor ? `${seed.label} with ${steps.label}` : seed.label });
         }
       }
-      const bounds = extent(points(ground));
-      // Directly clip the envelope as a fallback where the useful silhouette is irregular.
-      for (const strip of [0, 0.12, 0.22, 0.32, 0.42]) {
-        seeds.push({
-          geometry: clipRoadSide(ctx, envelopes[0].geometry, bounds.minX + strip * (bounds.maxX - bounds.minX)),
-          label: 'parcel-derived wing',
-        });
-      }
-      for (const seed of seeds) for (const steps of patterns) {
-        evaluated++;
-        const floors = floorSequence(ctx, envelopes, seed.geometry, steps);
-        if (!floors) continue;
-        const gfaM2 = floors.reduce((sum, floor) => sum + scope.area(floor.geometry), 0);
-        const footprintM2 = scope.area(floors[0].geometry);
-        if (!planningBudget(ctx, gfaM2, footprintM2, bandCap) || footprintM2 > maxFootprint) continue;
-        screened.push({ floors, gfaM2, footprintM2,
-          family: steps ? `${seed.label} with ${steps.label}` : seed.label });
-      }
     }
+    return screened;
   }
 
-  const highestArea = [...screened].sort(descendingGfa);
-  const nearTarget = other ? highestArea.filter(({ gfaM2 }) => gfaM2 >= other.gfaM2 * 0.78) : highestArea;
-  const preferred = strategy === 'stepped' && nearTarget.length ? [...nearTarget].sort(byFootprint) : highestArea;
-  // Check both the objective leaders and the highest-area alternatives. This bounded
-  // shortlist makes the reported best a measured result within the checked search.
-  const finalists = new Set([...preferred.slice(0, 12), ...highestArea.slice(0, 8)]);
   let validated = 0;
+  let independentlyChecked = 0;
+  let frontageFailures = 0;
   let bestValidatedGfaM2: number | null = null;
   let concept: Concept | null = null;
-  for (const candidate of finalists) {
-    const checked = scope.temporary(() => proposal(ctx, strategy, candidate, other));
-    if (!checked) continue;
-    validated++;
-    bestValidatedGfaM2 = Math.max(bestValidatedGfaM2 ?? 0, checked.gfaM2);
-    concept ??= checked;
+  function checkFinalists(screened: RatedDesign[]) {
+    const highestArea = [...screened].sort(descendingGfa);
+    const nearTarget = other ? highestArea.filter(({ gfaM2 }) => gfaM2 >= other.gfaM2 * 0.78) : highestArea;
+    const preferred = strategy === 'stepped' && nearTarget.length ? [...nearTarget].sort(byFootprint) : highestArea;
+    // Check both objective leaders and highest-area alternatives.
+    const finalists = new Set([...preferred.slice(0, 12), ...highestArea.slice(0, 8)]);
+    independentlyChecked += finalists.size;
+    for (const candidate of finalists) {
+      const checked = scope.temporary(() => proposal(ctx, strategy, candidate, other));
+      if (checked.frontageFailure) frontageFailures++;
+      if (!checked.concept) continue;
+      validated++;
+      bestValidatedGfaM2 = Math.max(bestValidatedGfaM2 ?? 0, checked.concept.gfaM2);
+      concept ??= checked.concept;
+    }
   }
-  return { concept, evaluated, independentlyChecked: finalists.size, validated, bestValidatedGfaM2 };
+  checkFinalists(collect(false));
+  if (!concept) checkFinalists(collect(true));
+  return { concept, evaluated, independentlyChecked, validated, bestValidatedGfaM2, frontageFailures };
 }

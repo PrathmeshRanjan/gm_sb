@@ -1,4 +1,4 @@
-import type { LineString, MultiPolygon, Polygon } from 'geojson';
+import type { LineString, MultiLineString, MultiPolygon, Polygon } from 'geojson';
 
 export type AreaGeometry = Polygon | MultiPolygon;
 export type ProfileId = 'house' | 'multifamily';
@@ -6,6 +6,15 @@ export type Strategy = 'wide' | 'stepped';
 export type WidthSource = 'district-inventory' | 'user-override' | 'unverified';
 
 export interface ScenarioRoad {
+  id?: string;
+  sameRoadIds?: string[];
+  roadClass?: string;
+  access?: string;
+  vehicle?: string;
+  motorVehicle?: string;
+  bridge?: string;
+  tunnel?: string;
+  layer?: string;
   name: string;
   centerline: LineString;
   widthM: number;
@@ -19,6 +28,13 @@ export interface ScenarioRoad {
 
 export interface ScenarioInput {
   plot: Polygon;
+  /** Full sourced zoning feature. Null is an explicit unavailable boundary; omitted supports legacy fixtures. */
+  zoneBoundary?: AreaGeometry | null;
+  contextCoverage?: AreaGeometry;
+  screeningCoverage?: AreaGeometry;
+  screeningAreas?: { id: string; label: string; sourceUrl: string; geometry: AreaGeometry }[];
+  nearbyRoads?: { id: string; name: string; centerline: LineString; widthM?: number; roadClass?: string }[];
+  roadSelectionAvailable?: boolean;
   profile: ProfileId;
   road: ScenarioRoad;
   redevelopment: 'clear' | 'retain';
@@ -67,6 +83,10 @@ export interface Concept {
   rationale: string;
   tradeOff: string;
   limitingFactors: string[];
+  /** Slices for this proposal's independently measured GFA and building height. */
+  envelope?: FloorPlate[];
+  envelopeExplanation?: BoundExplanation;
+  envelopeRules?: RuleResult[];
 }
 
 export interface BoundExplanation {
@@ -90,7 +110,8 @@ export interface SearchSummary {
 }
 
 export interface ScenarioResult {
-  validation: 'valid' | 'invalid' | 'outside-coverage' | 'road-conflict';
+  validation: 'valid' | 'invalid' | 'outside-coverage' | 'outside-zone' | 'data-unavailable' | 'unsupported-site' | 'road-conflict';
+  zoneEligibility?: 'inside' | 'outside' | 'unavailable' | 'study-area-only';
   message?: string;
   plotAreaM2: number;
   coverageVerified: boolean;
@@ -103,6 +124,7 @@ export interface ScenarioResult {
     widthM: number;
     inferred: boolean;
     frontageM: number;
+    frontage?: MultiLineString;
     conflictM2: number;
   } | null;
   capacity: {

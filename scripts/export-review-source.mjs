@@ -7,7 +7,7 @@ import { join, resolve } from 'node:path';
 const paths = [
   '.gitignore', 'README.md', 'PHASE-1-RESEARCH.md', 'index.html', 'package.json',
   'package-lock.json', 'playwright.config.ts', 'tsconfig.json', 'vite.config.ts',
-  'src', 'tests', 'scripts', 'research/IMPLEMENTATION-EVIDENCE.md', 'research/NUMERICAL-REVIEW.md',
+  'src', 'tests', 'scripts', 'research/IMPLEMENTATION-EVIDENCE.md', 'research/NUMERICAL-REVIEW.md', 'research/ZONE-COVERAGE.md', 'research/V4-VERIFICATION.md',
   'public/data', 'public/favicon.svg', 'public/geometry-credits.txt', 'public/geos-wasm-license.txt',
 ];
 

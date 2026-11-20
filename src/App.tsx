@@ -5,7 +5,7 @@ import {
 } from 'lucide-react';
 import type { Polygon } from 'geojson';
 import AnalysisMap, { type MapMode } from './AnalysisMap';
-import { loadContext, nearbyBuildings, type ContextData } from './context';
+import { loadContext, namedRoadLocations, nearbyBuildings, roadsForPlot, type ContextData } from './context';
 import type {
   CalculateRequest, CalculateResponse, Concept, FloorPlate, ProfileId, RuleResult, ScenarioInput, ScenarioResult, Strategy,
 } from './engine/types';
@@ -112,7 +112,7 @@ function useAnalysis(input: ScenarioInput | null) {
     error: workerError || current?.error || '',
     roundtrip: current?.roundtrip ?? 0,
     requestId: current?.result ? current.request.id : undefined,
-    resultWidth: current?.result ? current.request.input.road.widthM : undefined,
+    resultWidth: current?.result && current.request.input.roadSelectionAvailable !== false ? current.request.input.road.widthM : undefined,
     restart: () => setRun((value) => value + 1),
   };
 }
@@ -195,14 +195,15 @@ function DesignSchedule({ concept }: { concept: Concept }) {
   </details>;
 }
 
-function BoundExplanation({ result, onViewBound }: { result: ScenarioResult | null; onViewBound: () => void }) {
-  const bound = result?.boundExplanation;
+function BoundExplanation({ bound, selected, onViewBound }: {
+  bound: ScenarioResult['boundExplanation']; selected?: boolean; onViewBound: () => void;
+}) {
   if (!bound) return null;
-  return <details className="inspection-details" data-testid="bound-explanation">
-    <summary><span>Inspect geometric bound</span><span className="inspection-value">{sqmExactDisplay(bound.sumM2)}</span><ChevronDown size={15} /></summary>
+  return <details className="inspection-details" data-testid={selected ? 'selected-envelope-explanation' : 'bound-explanation'}>
+    <summary><span>{selected ? 'Inspect selected envelope' : 'Inspect geometric bound'}</span><span className="inspection-value">{sqmExactDisplay(bound.sumM2)}</span><ChevronDown size={15} /></summary>
     <div className="inspection-body">
       <dl className="bound-candidate">
-        <div><dt>Bound candidate</dt><dd>{bound.floorCount} {bound.floorCount === 1 ? 'floor' : 'floors'} · {twoPlaces.format(bound.heightM)} m</dd></div>
+        <div><dt>{selected ? 'Selected design' : 'Capacity candidate'}</dt><dd>{bound.floorCount} {bound.floorCount === 1 ? 'floor' : 'floors'} · {twoPlaces.format(bound.heightM)} m</dd></div>
         <div><dt>Building classification</dt><dd>{bound.classification.join(' · ')}</dd></div>
       </dl>
       <FloorSchedule floors={bound.floors} total={bound.sumM2} kind="envelope" />
@@ -211,7 +212,7 @@ function BoundExplanation({ result, onViewBound }: { result: ScenarioResult | nu
         <div><h3>Excluded from the slice sum</h3><ul>{bound.excluded.map((item) => <li key={item}>{item}</li>)}</ul></div>
       </div>
       <p className="fine-print">{bound.reason}</p>
-      <button type="button" className="text-button bound-view" data-testid="show-envelope-bound" onClick={onViewBound}><Layers3 size={15} /> Show bound in 3D</button>
+      <button type="button" className="text-button bound-view" data-testid={selected ? 'show-selected-envelope' : 'show-envelope-bound'} onClick={onViewBound}><Layers3 size={15} /> {selected ? 'Show selected envelope in 3D' : 'Show capacity bound in 3D'}</button>
     </div>
   </details>;
 }
@@ -247,7 +248,7 @@ function ConceptCard({ strategy, concept, message, active, onSelect }: {
   >
     <span className={`concept-icon ${wide ? 'wide' : 'stepped'}`}>{wide ? <Building2 size={20} /> : <Layers3 size={20} />}</span>
     <span className="concept-main">
-      <strong>{wide ? 'Wider / lower' : 'Narrower / stepped'}</strong>
+      <strong>{wide ? 'Wider / lower' : concept?.name === 'Compact garden form' ? 'Narrower / garden' : 'Narrower / stepped'}</strong>
       {concept
         ? <span>{concept.floors.length} {concept.floors.length === 1 ? 'floor' : 'floors'} · {format.format(concept.heightM)} m</span>
         : <span>{message || 'Awaiting a feasible envelope'}</span>}
@@ -276,10 +277,14 @@ function Sources({ context, dialog }: { context: ContextData; dialog: React.RefO
       </section>
       <section>
         <h3>Neighborhood data</h3>
-        <p>The green coverage outline marks the study area within ย.๙-๑๓. The scenario parcel is editable. Road edges are inferred from the chosen centerline and width.</p>
+        <p>{context.site.zoneBoundary ? 'The green outline is the published ย.๙-๑๓ zoning boundary.' : 'The dashed outline marks the original verified study area within ย.๙-๑๓; the full zone geometry is unavailable.'} The scenario parcel is editable. Road edges are inferred from the chosen centerline and width. Zoning membership, available neighborhood data and parcel-specific screening each have their own status.</p>
         <div className="source-links">
           <Source href={context.site.road.sourceUrl}>District road inventory</Source>
-          <Source href="https://data.go.th/en/dataset/lup_polygon">BMA land-use dataset</Source>
+          <Source href={context.site.zone?.sourceUrl ?? 'https://data.go.th/en/dataset/lup_polygon'}>BMA land-use geometry</Source>
+          {context.site.zone?.catalogUrl && <Source href={context.site.zone.catalogUrl}>Government data catalogue</Source>}
+          {context.site.zone?.licenseUrl && <Source href={context.site.zone.licenseUrl}>Reuse basis</Source>}
+          {context.site.zone?.boundaryDescriptionUrl && <Source href={context.site.zone.boundaryDescriptionUrl}>Statutory boundary description</Source>}
+          <Source href={`${import.meta.env.BASE_URL}data/manifest.json`}>Data provenance and screening coverage</Source>
           <Source href="https://www.openstreetmap.org/copyright">OpenStreetMap roads</Source>
           <Source href="https://stac.overturemaps.org/2026-11-18.0/buildings/building/collection.json">Overture building collection</Source>
         </div>
@@ -291,61 +296,98 @@ function Sources({ context, dialog }: { context: ContextData; dialog: React.RefO
 function Workspace({ context }: { context: ContextData }) {
   const { site } = context;
   const baselineRoad = site.road;
-  const roadOptions = site.roadOptions ?? [baselineRoad];
   const [plot, setPlot] = useState(site.parcel);
   const [profile, setProfile] = useState<ProfileId>('multifamily');
   const [roadId, setRoadId] = useState(String(baselineRoad.wayId));
   const [widthOverride, setWidthOverride] = useState<string | null>(null);
+  const [widthRoadId, setWidthRoadId] = useState(String(baselineRoad.wayId));
   const [edge, setEdge] = useState<number>();
   const [mode, setMode] = useState<MapMode>('3d');
+  const drawing = mode === 'draw';
   const [redevelopment, setRedevelopment] = useState<'clear' | 'retain'>('clear');
   const [retainedAmounts, setRetainedAmounts] = useState<Record<string, string>>({});
   const [footprintsOnly, setFootprintsOnly] = useState(false);
   const [envelopeVisible, setEnvelopeVisible] = useState(true);
   const [conceptVisible, setConceptVisible] = useState(true);
+  const [envelopeKind, setEnvelopeKind] = useState<'selected' | 'capacity'>('selected');
+  const [cameraTarget, setCameraTarget] = useState<{ center: [number, number]; zoom: number; bearing?: number; pitch?: number }>();
+  const [locationKey, setLocationKey] = useState('');
   const [selected, setSelected] = useState<Strategy>('wide');
   const [tab, setTab] = useState<'scenario' | 'rules'>('scenario');
   const dialog = useRef<HTMLDialogElement>(null);
   const sidebarContent = useRef<HTMLDivElement>(null);
   const designSection = useRef<HTMLElement>(null);
   const jumpToDesign = useRef(false);
-  const road = roadOptions.find((option) => String(option.wayId) === roadId) ?? baselineRoad;
-  const widthText = widthOverride ?? (road.width != null ? road.width.toFixed(2) : '');
+  const roadOptions = useMemo(() => roadsForPlot(plot, context), [plot, context]);
+  const roadLocations = useMemo(() => namedRoadLocations(context.roads), [context.roads]);
+  const road = roadOptions.find((option) => option.key === roadId) ?? roadOptions[0];
+  const currentWidthOverride = road?.key === widthRoadId ? widthOverride : null;
+  const widthText = currentWidthOverride ?? (road?.width != null ? road.width.toFixed(2) : '');
   const widthM = Number(widthText);
-  const validWidth = widthText.trim() !== '' && Number.isFinite(widthM) && widthM > 0 && widthM <= 100;
+  const validWidth = widthText.trim() !== '' && Number.isFinite(widthM) && widthM >= 2 && widthM <= 100;
 
   const input = useMemo<ScenarioInput | null>(() => {
-    if (!validWidth) return null;
+    if (drawing) return null;
     return {
       plot,
       profile,
-      frontageEdgeIndex: edge,
+      frontageEdgeIndex: road?.key === roadId ? edge : undefined,
       redevelopment,
+      zoneBoundary: site.zoneBoundary ?? null,
+      contextCoverage: site.coverage,
+      screeningCoverage: site.screeningCoverage ?? site.coverage,
+      screeningAreas: site.screeningAreas,
+      roadSelectionAvailable: road !== undefined && validWidth,
+      nearbyRoads: roadOptions.map((option) => ({
+        id: String(option.wayId), name: option.name, centerline: option.mappedCenterline, widthM: option.width ?? undefined, roadClass: option.roadClass,
+      })),
       retainedBuildings: nearbyBuildings(plot, context.buildings).map((building) => {
         const entered = retainedAmounts[building.id];
         const eligibleGrossFloorAreaM2 = entered ? Number(entered) : undefined;
         return { ...building, eligibleGrossFloorAreaM2: eligibleGrossFloorAreaM2 && eligibleGrossFloorAreaM2 > 0 ? eligibleGrossFloorAreaM2 : undefined };
       }),
       road: {
-        name: road.name,
-        widthM,
-        widthSource: widthOverride === null ? 'district-inventory' : 'user-override',
-        baselineWidthM: road.width ?? undefined,
-        sourceUrl: road.sourceUrl,
-        centerline: road.centerline,
-        publicStatus: road.wayId === baselineRoad.wayId ? 'documented' : 'assumed',
+        id: road ? String(road.wayId) : undefined,
+        sameRoadIds: road?.sameRoadIds,
+        roadClass: road?.roadClass,
+        access: road?.access,
+        vehicle: road?.vehicle,
+        motorVehicle: road?.motorVehicle,
+        bridge: road?.bridge,
+        tunnel: road?.tunnel,
+        layer: road?.layer,
+        name: road?.name ?? 'Road selection unavailable',
+        widthM: validWidth ? widthM : (baselineRoad.width ?? 2),
+        widthSource: !validWidth ? 'unverified' : currentWidthOverride === null ? 'district-inventory' : 'user-override',
+        baselineWidthM: road?.width ?? undefined,
+        sourceUrl: road?.sourceUrl,
+        centerline: road?.centerline ?? baselineRoad.centerline,
+        publicStatus: road?.wayId === baselineRoad.wayId ? 'documented' : 'unknown',
       },
     };
-  }, [baselineRoad.wayId, context.buildings, edge, plot, profile, redevelopment, retainedAmounts, road, validWidth, widthM, widthOverride]);
+  }, [baselineRoad, context.buildings, currentWidthOverride, drawing, edge, plot, profile, redevelopment, retainedAmounts, road, roadId, roadOptions, site, validWidth, widthM]);
 
   const { result, pending, error, roundtrip, requestId, resultWidth, restart } = useAnalysis(input);
   const concept = result?.concepts.find(({ id }) => id === selected) ?? result?.concepts[0] ?? null;
+  const mapEnvelopeKind = concept && envelopeKind === 'selected' ? 'selected' : 'capacity';
+  const mapEnvelope = mapEnvelopeKind === 'selected' ? concept?.envelope ?? [] : result?.envelope ?? [];
   const siteEvidence = [...(result?.siteEvidence ?? []), ...(concept?.siteEvidence ?? [])];
   const affectedIds = result?.affectedBuildingIds ?? noIds;
   const open = concept && result?.plotAreaM2 ? (concept.openM2 / result.plotAreaM2) * 100 : null;
   const editing = mode === 'vertices' || mode === 'draw';
   const resultProvenance = { 'data-request-id': requestId, 'data-result-width': resultWidth };
   const search = result?.search;
+  const eligibilityText = result?.zoneEligibility === 'inside' ? 'Inside ย.๙-๑๓'
+    : result?.zoneEligibility === 'outside' ? 'Outside ย.๙-๑๓'
+      : result?.zoneEligibility === 'study-area-only' ? 'Inside the verified study area'
+        : result?.zoneEligibility === 'unavailable' ? 'Zone eligibility unavailable'
+          : pending ? 'Checking zone membership…' : 'Awaiting a parcel';
+  const siteStatusText = result?.validation === 'valid' ? 'Supported conditions modeled'
+    : result?.validation === 'outside-zone' ? 'Outside the chosen zone'
+      : result?.validation === 'unsupported-site' ? 'Site conditions require review'
+        : result?.validation === 'data-unavailable' || result?.validation === 'outside-coverage' ? 'Site data unavailable'
+          : result?.validation === 'road-conflict' ? 'Road right-of-way conflict'
+            : result?.validation === 'invalid' ? 'Invalid plot or inputs' : pending ? 'Checking inputs…' : 'Waiting for inputs';
 
   useEffect(() => {
     if (tab === 'rules' && jumpToDesign.current) {
@@ -363,13 +405,45 @@ function Workspace({ context }: { context: ContextData }) {
   }
 
   function showBound() {
+    setEnvelopeKind('capacity');
     setEnvelopeVisible(true);
     setConceptVisible(false);
     setMode('3d');
   }
 
+  function showSelectedEnvelope() {
+    setEnvelopeKind('selected');
+    setEnvelopeVisible(true);
+    setConceptVisible(false);
+    setMode('3d');
+  }
+
+  function changeRoad(key: string) {
+    setRoadId(key);
+    setWidthRoadId(key);
+    setWidthOverride(null);
+    setEdge(undefined);
+  }
+
+  function overrideWidth(value: string | null) {
+    if (!road) return;
+    if (road.key !== roadId) setRoadId(road.key);
+    setWidthRoadId(road.key);
+    setWidthOverride(value);
+  }
+
   function changePlot(next: Polygon) {
     if (next.coordinates[0].length !== plot.coordinates[0].length || mode === 'draw') setEdge(undefined);
+    if (mode === 'draw') {
+      setRetainedAmounts({});
+      setWidthOverride(null);
+      setEnvelopeKind('selected');
+      setConceptVisible(true);
+      setLocationKey('');
+      // A new drawing may be in another neighborhood. Auto-select its nearest mapped road.
+      const nearest = roadsForPlot(next, context)[0];
+      changeRoad(nearest?.key ?? '');
+    }
     setPlot(next);
   }
 
@@ -377,6 +451,7 @@ function Workspace({ context }: { context: ContextData }) {
     setPlot(site.parcel);
     setProfile('multifamily');
     setRoadId(String(baselineRoad.wayId));
+    setWidthRoadId(String(baselineRoad.wayId));
     setWidthOverride(null);
     setEdge(undefined);
     setMode('3d');
@@ -386,6 +461,43 @@ function Workspace({ context }: { context: ContextData }) {
     setFootprintsOnly(false);
     setEnvelopeVisible(true);
     setConceptVisible(true);
+    setEnvelopeKind('selected');
+    setLocationKey('');
+    setCameraTarget({ ...site.camera });
+  }
+
+  function goToRoad(key: string) {
+    setLocationKey(key);
+    const example = site.examples?.find((item) => `example:${item.id}` === key);
+    if (example) {
+      setMode('plan');
+      setCameraTarget({ center: example.camera.center, zoom: example.camera.zoom, bearing: 0, pitch: 0 });
+      return;
+    }
+    const target = roadLocations.find((location) => location.key === key);
+    if (!target) return;
+    setMode('plan');
+    setCameraTarget({ center: target.center, zoom: 17.8, bearing: 0, pitch: 0 });
+  }
+
+  const locationExample = site.examples?.find((item) => `example:${item.id}` === locationKey);
+
+  function loadExample() {
+    if (!locationExample) return;
+    const key = String(locationExample.roadId);
+    const exampleRoad = roadsForPlot(locationExample.parcel, context).find((option) => option.key === key || String(option.wayId) === key);
+    setPlot(locationExample.parcel);
+    setProfile(locationExample.profile);
+    changeRoad(exampleRoad?.key ?? key);
+    setWidthOverride(String(locationExample.widthM));
+    setRetainedAmounts({});
+    setRedevelopment('clear');
+    setSelected('wide');
+    setEnvelopeKind('selected');
+    setConceptVisible(true);
+    setMode('plan');
+    setCameraTarget({ center: locationExample.camera.center, zoom: locationExample.camera.zoom, bearing: 0, pitch: 0 });
+    setLocationKey('');
   }
 
   return <div className="app-shell">
@@ -407,8 +519,13 @@ function Workspace({ context }: { context: ContextData }) {
           requestId={requestId}
           resultWidth={resultWidth}
           concept={conceptVisible ? concept : null}
-          centerline={road.centerline}
-          roadName={road.name}
+          envelope={mapEnvelope}
+          envelopeKind={mapEnvelopeKind}
+          centerline={road?.centerline}
+          roadName={road?.name}
+          roadId={road?.key}
+          nearbyRoadCount={roadOptions.length}
+          cameraTarget={cameraTarget}
           frontageEdgeIndex={edge}
           footprintsOnly={footprintsOnly}
           envelopeVisible={envelopeVisible}
@@ -418,17 +535,21 @@ function Workspace({ context }: { context: ContextData }) {
           <span><ScanLine size={14} /> Editable scenario boundary <span className="desktop-source">· Surveyed title boundary unavailable</span></span>
           <div className="map-footer-options">
             <label><input type="checkbox" data-testid="footprints-toggle" checked={footprintsOnly} onChange={(event) => setFootprintsOnly(event.target.checked)} /> Footprints only</label>
-            <label><input type="checkbox" checked={envelopeVisible} onChange={(event) => setEnvelopeVisible(event.target.checked)} /> Envelope</label>
-            <label title="Hide the design to see the full 3D floor envelope."><input type="checkbox" checked={conceptVisible} onChange={(event) => setConceptVisible(event.target.checked)} /> Design</label>
+            <label><input type="checkbox" checked={envelopeVisible} onChange={(event) => setEnvelopeVisible(event.target.checked)} /> {envelopeKind === 'capacity' ? 'Capacity bound' : 'Envelope'}</label>
+            <label title="Hide the design to see the full 3D floor envelope."><input type="checkbox" checked={conceptVisible} onChange={(event) => { setConceptVisible(event.target.checked); if (event.target.checked) setEnvelopeKind('selected'); }} /> Design</label>
           </div>
         </div>
       </div>
 
       <aside className="sidebar" aria-label="Scenario analysis">
         <div className="sidebar-intro">
-          <div className="eyebrow"><span className="location-dot" /> INTHAMARA STUDY AREA</div>
-          <div className="sidebar-heading"><h1>Pracha Suk</h1><button type="button" className="icon-button reset-button" data-testid="reset-scenario" onClick={reset} title="Reset scenario" aria-label="Reset scenario"><RotateCcw size={18} /></button></div>
+          <div className="eyebrow"><span className="location-dot" /> {site.zoneBoundary ? 'DIN DAENG · ย.๙-๑๓' : 'INTHAMARA STUDY AREA'}</div>
+          <div className="sidebar-heading"><h1>{road?.name === 'Pracha Suk Road' ? 'Pracha Suk' : road?.name ?? 'New parcel'}</h1><button type="button" className="icon-button reset-button" data-testid="reset-scenario" onClick={reset} title="Reset scenario" aria-label="Reset scenario"><RotateCcw size={18} /></button></div>
           <p className="site-meta">Residential feasibility · 2013 Bangkok plan</p>
+          <div className="site-eligibility" data-testid="site-eligibility" data-zone={result?.zoneEligibility} data-state={result?.validation} {...resultProvenance}>
+            <span className={result?.zoneEligibility === 'inside' || result?.zoneEligibility === 'study-area-only' ? 'eligible' : 'conditional'}>{eligibilityText}</span>
+            <span>{siteStatusText}</span>
+          </div>
           <div className="top-metrics" data-testid="scenario-metrics" {...resultProvenance}>
             <div><span>Scenario parcel</span><strong>{result?.plotAreaM2 != null ? format.format(result.plotAreaM2) : '—'} <small>m²</small></strong></div>
             <div><span>Design GFA</span><strong>{concept ? format.format(concept.gfaM2) : '—'} <small>m²</small></strong></div>
@@ -448,6 +569,16 @@ function Workspace({ context }: { context: ContextData }) {
             <section className="analysis-section">
               <div className="section-heading"><h2>Site inputs</h2><button type="button" className="text-button" data-testid="edit-plot" onClick={() => setMode(editing ? '3d' : 'vertices')}><PencilLine size={15} /> {editing ? 'Finish editing' : 'Edit plot'}</button></div>
               <div className="input-row">
+                <label htmlFor="road-location"><MapPin size={15} /> Explore map</label>
+                <select id="road-location" data-testid="road-location" value={locationKey} onChange={(event) => goToRoad(event.target.value)}>
+                  <option value="">Go to a mapped street</option>
+                  {site.examples && site.examples.length > 0 && <optgroup label="Illustrative scenario locations">{site.examples.map((example) => <option key={example.id} value={`example:${example.id}`}>{example.label}</option>)}</optgroup>}
+                  {roadLocations.map((location) => <option value={location.key} key={location.key}>{location.name}</option>)}
+                </select>
+              </div>
+              {locationKey && <p className="fine-print">The current analysis still refers to the outlined parcel. Draw a new parcel at the browsed location to calculate there.</p>}
+              {locationExample && <button className="text-button location-example" data-testid="load-location-example" type="button" onClick={loadExample}><PencilLine size={15} /> Load editable scenario example</button>}
+              <div className="input-row">
                 <label htmlFor="building-profile"><House size={15} /> Building type</label>
                 <select id="building-profile" data-testid="building-profile" value={profile} onChange={(event) => setProfile(event.target.value as ProfileId)}>
                   <option value="multifamily">Small multifamily</option>
@@ -456,22 +587,29 @@ function Workspace({ context }: { context: ContextData }) {
               </div>
               <div className="input-row">
                 <label htmlFor="road-select"><ArrowDownRight size={15} /> Facing road</label>
-                <select id="road-select" data-testid="road-select" value={roadId} onChange={(event) => { setRoadId(event.target.value); setWidthOverride(null); setEdge(undefined); }}>
-                  {roadOptions.map((option) => <option key={option.wayId} value={option.wayId}>{option.name}</option>)}
+                <select id="road-select" data-testid="road-select" value={road?.key ?? ''} disabled={!roadOptions.length} onChange={(event) => changeRoad(event.target.value)}>
+                  {!roadOptions.length && <option value="">No mapped road nearby</option>}
+                  {roadOptions.map((option) => <option key={option.key} value={option.key}>{option.name} · {format.format(option.distanceM)} m</option>)}
                 </select>
               </div>
+              {road && <div className="road-provenance" data-testid="road-provenance" data-road-id={road.key}>
+                <span>{road.roadClass ?? 'Mapped road'} · {road.wayId === baselineRoad.wayId ? 'District inventory' : 'Legal public access unverified'}</span>
+                {road.geometrySourceUrl && <Source href={road.geometrySourceUrl}>OSM alignment</Source>}
+                {road.accessEvidence && <span>{road.accessEvidence}</span>}
+                {road.mappedWidth != null && <span>OSM width tag: {road.mappedWidth} (legal ROW unverified)</span>}
+              </div>}
               <div className="input-row">
                 <label htmlFor="road-width"><Ruler size={15} /> Right-of-way width</label>
-                <div className="width-field"><input id="road-width" data-testid="road-width" type="number" min="0.01" max="100" step="0.01" inputMode="decimal" placeholder="Scenario width" value={widthText} onChange={(event) => setWidthOverride(event.target.value)} /><span>m</span></div>
+                <div className="width-field"><input id="road-width" data-testid="road-width" type="number" min="2" max="100" step="0.01" inputMode="decimal" placeholder="Scenario width" value={widthText} disabled={!road} onChange={(event) => overrideWidth(event.target.value)} /><span>m</span></div>
               </div>
               <div className="width-source">
-                {widthOverride !== null ? <span className="what-if-tag">What-if width</span> : road.width != null ? <Source href={road.sourceUrl}>District inventory</Source> : <span>Width unavailable</span>}
-                {widthOverride !== null && road.width != null && <button className="text-button" type="button" onClick={() => setWidthOverride(null)}>Restore {road.width.toFixed(2)} m</button>}
-                {widthOverride === null && road.width != null && <button className="text-button" type="button" onClick={() => setWidthOverride('6')}>Try 6 m</button>}
-                {road.width != null && widthM !== 2 && <button className="text-button" type="button" onClick={() => setWidthOverride('2')}>2 m stress test</button>}
+                {validWidth && currentWidthOverride !== null ? <span className="what-if-tag">What-if width</span> : road?.width != null && currentWidthOverride === null ? <Source href={road.sourceUrl}>District inventory</Source> : <span>Width unavailable</span>}
+                {currentWidthOverride !== null && road?.width != null && <button className="text-button" type="button" onClick={() => overrideWidth(null)}>Restore {road.width.toFixed(2)} m</button>}
+                {currentWidthOverride === null && road?.width != null && <button className="text-button" type="button" onClick={() => overrideWidth('6')}>Try 6 m</button>}
+                {road?.width != null && widthM !== 2 && <button className="text-button" type="button" onClick={() => overrideWidth('2')}>2 m stress test</button>}
               </div>
-              {!validWidth && <p className="inline-error">Enter a scenario width greater than 0 m and at most 100 m.</p>}
-              {widthOverride !== null && widthM === 2 && <p className="fine-print road-stress-note">The narrow road can clip upper envelope slices. A design may keep the same area when all of its plates fit inside the revised slices.</p>}
+              {!validWidth && road && <p className="inline-error">Enter a right-of-way scenario width from 2 to 100 m (supported application range).</p>}
+              {currentWidthOverride !== null && widthM === 2 && <p className="fine-print road-stress-note">The narrow road can clip upper envelope slices. A design may keep the same area when all of its plates fit inside the revised slices.</p>}
               <div className="input-row">
                 <label htmlFor="frontage-edge">Parcel frontage</label>
                 <select id="frontage-edge" data-testid="frontage-select" value={edge ?? ''} onChange={(event) => setEdge(event.target.value === '' ? undefined : Number(event.target.value))}>
@@ -496,7 +634,9 @@ function Workspace({ context }: { context: ContextData }) {
                     setRetainedAmounts((old) => ({ ...old, [id]: value }));
                   }} /><span>m²</span></div>
                 </div>)}
-                <p>Context heights use reported floor counts × 3.1 m where available. The remaining buildings use 6 m schematic extrusions.</p>
+                <p>Context heights distinguish sourced height, estimates from reported floor counts × 3.1 m, and 6 m schematic extrusions where neither is available. The map supports a single editable outer parcel ring. The engine can evaluate polygon holes, but the drawing controls do not create them.</p>
+                <p>Screening coverage is separate from zoning membership. {result?.coverageVerified ? 'The parcel lies in the area covered by the listed overlay checks.' : 'The listed parcel-specific overlay screening coverage is incomplete here.'} Other site design and legal checks remain open.</p>
+                {site.screeningNotes?.map((note) => <p key={note}>{note}</p>)}
               </details>
             </section>
 
@@ -508,7 +648,7 @@ function Workspace({ context }: { context: ContextData }) {
                   strategy={strategy}
                   concept={result?.concepts.find(({ id }) => id === strategy)}
                   active={concept?.id === strategy}
-                  onSelect={() => { setSelected(strategy); setConceptVisible(true); }}
+                  onSelect={() => { setSelected(strategy); setConceptVisible(true); setEnvelopeKind('selected'); }}
                   message={result?.conceptMessages[strategy]}
                 />)}
               </div>
@@ -532,15 +672,20 @@ function Workspace({ context }: { context: ContextData }) {
             <section className="analysis-section">
               <div className="section-heading"><h2>Capacity</h2><Source href={plan}>Plan §16</Source></div>
               <Capacity result={result} concept={concept} />
-              <BoundExplanation result={result} onViewBound={showBound} />
+              <BoundExplanation bound={result?.boundExplanation ?? null} onViewBound={showBound} />
             </section>
             <section className="analysis-section" data-testid="envelope-rules" {...resultProvenance}>
-              <div className="section-heading"><h2>Envelope constraints</h2></div>
-              <p className="fine-print">These rows describe the building height and floor count used to compute the geometric bound.</p>
-              <Rules rules={result?.rules ?? []} group="envelope" emptyText="No bound constraints are available for this scenario." />
+              <div className="section-heading"><h2>{mapEnvelopeKind === 'selected' ? 'Selected envelope constraints' : 'Capacity envelope constraints'}</h2><span className="muted-count">{mapEnvelopeKind === 'selected' ? concept?.floors.length : result?.boundExplanation?.floorCount} floors</span></div>
+              <div className="envelope-view-switch" aria-label="Envelope view">
+                <button type="button" data-testid="envelope-view-selected" aria-pressed={mapEnvelopeKind === 'selected'} disabled={!concept} onClick={() => { setEnvelopeKind('selected'); setEnvelopeVisible(true); setConceptVisible(true); }}>Selected design</button>
+                <button type="button" data-testid="envelope-view-capacity" aria-pressed={mapEnvelopeKind === 'capacity'} disabled={!result?.envelope.length} onClick={() => { setEnvelopeKind('capacity'); setEnvelopeVisible(true); setConceptVisible(false); }}>Capacity bound</button>
+              </div>
+              <p className="fine-print">{mapEnvelopeKind === 'selected' ? 'These slices use the selected design’s actual height, floor count and category. Each occupied plate is checked against its applicable slice.' : 'These rows describe the height and floor count used to compute the separate maximum slice-area bound.'}</p>
+              {concept && <BoundExplanation bound={concept.envelopeExplanation ?? null} selected onViewBound={showSelectedEnvelope} />}
+              <Rules rules={mapEnvelopeKind === 'selected' ? concept?.envelopeRules ?? [] : result?.rules ?? []} group="envelope" emptyText="No envelope constraints are available for this scenario." />
             </section>
             <section className="analysis-section" data-testid="design-rules" data-concept-id={concept?.id} ref={designSection} tabIndex={-1} {...resultProvenance}>
-              <div className="section-heading"><h2>Selected-design checks</h2>{concept && <span className="muted-count">{concept.id === 'wide' ? 'Wider / lower' : 'Narrower / stepped'}</span>}</div>
+              <div className="section-heading"><h2>Selected-design checks</h2>{concept && <span className="muted-count">{concept.id === 'wide' ? 'Wider / lower' : concept.name === 'Compact garden form' ? 'Narrower / garden' : 'Narrower / stepped'}</span>}</div>
               <p className="fine-print">These checks use the actual selected design. Its height and floor count can trigger different rules from the bound candidate.</p>
               {concept && <dl className="area-detail">
                 <div><dt>Covered projection</dt><dd>{sqmExactDisplay(concept.coveredM2)}</dd></div>
@@ -560,7 +705,7 @@ function Workspace({ context }: { context: ContextData }) {
         </div>
 
         <div className="sidebar-footer" aria-live="polite">
-          {!pending && result ? <span data-testid="result-ready" {...resultProvenance} data-state={result.validation} data-elapsed-ms={result.elapsedMs} data-roundtrip-ms={roundtrip}><i className={result.validation === 'valid' ? 'ready' : 'needs-review'} /> {result.validation === 'valid' ? 'Scenario calculated' : 'Scenario needs review'}</span>
+          {!pending && result ? <span data-testid="result-ready" {...resultProvenance} data-state={result.validation} data-zone={result.zoneEligibility} data-road-id={road?.key} data-elapsed-ms={result.elapsedMs} data-roundtrip-ms={roundtrip}><i className={result.validation === 'valid' ? 'ready' : 'needs-review'} /> {result.validation === 'valid' ? 'Scenario calculated' : siteStatusText}</span>
             : <span><i className={pending ? 'busy' : 'needs-review'} /> {pending ? 'Calculating…' : 'Waiting for inputs'}</span>}
           {!pending && result && <span>{Math.round(result.elapsedMs)} ms</span>}
           <button type="button" className="mobile-source text-button" onClick={() => dialog.current?.showModal()}>Sources <ExternalLink size={12} /></button>
@@ -585,5 +730,5 @@ export default function App() {
   }, [attempt]);
 
   if (context) return <Workspace context={context} />;
-  return <div className="app-loading"><Layers3 size={29} /><h1>Bangkok Site Study</h1>{error ? <><p role="alert">{error}</p><button className="header-source" type="button" onClick={() => setAttempt((value) => value + 1)}>Try again</button></> : <p role="status">Loading the Din Daeng study area…</p>}</div>;
+  return <div className="app-loading"><Layers3 size={29} /><h1>Bangkok Site Study</h1>{error ? <><p role="alert">{error}</p><button className="header-source" type="button" onClick={() => setAttempt((value) => value + 1)}>Try again</button></> : <p role="status">Loading the Din Daeng neighborhood data…</p>}</div>;
 }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from math import isclose
 from pathlib import Path
 
@@ -11,7 +12,7 @@ from shapely import geos_version_string, transform
 from shapely.geometry import LineString, Point, Polygon, box, shape
 from shapely.ops import unary_union
 
-from prepare_context import read_json
+from prepare_context import STUDY_BOUNDS, read_json
 
 
 def check_early_experiments() -> None:
@@ -60,7 +61,29 @@ def check_saved_site(evidence: Path, public: Path) -> None:
     coverage = shape(site["coverage"])
     parcel = project(shape(site["parcel"]))
     centerline = project(shape(site["road"]["centerline"]))
-    assert zone.is_valid and zone.covers(coverage)
+    original_study = box(*STUDY_BOUNDS)
+    assert zone.is_valid and zone.covers(original_study)
+    if "zoneBoundary" in site:
+        assert shape(site["zoneBoundary"]).equals_exact(zone, 0)
+        assert coverage.covers(zone)
+        assert shape(site["screeningCoverage"]).equals_exact(zone, 0)
+        assert isclose(project(zone).area, 2656407.5095317927, abs_tol=1e-5)
+        streets = {item["id"]: project(shape(item["geometry"])) for item in read_json(public / "roads.geojson")["features"]}
+        for example in site["examples"]:
+            example_plot = project(shape(example["parcel"]))
+            assert example_plot.is_valid and project(zone).covers(example_plot)
+            assert not example_plot.intersects(project(original_study))
+            assert not any(example_plot.intersects(project(shape(area["geometry"]))) for area in site["screeningAreas"])
+            assert isclose(example_plot.area, example["areaM2"], abs_tol=1e-5)
+            assert isclose(streets[example["roadId"]].distance(example_plot), example["widthM"] / 2, abs_tol=1e-5)
+            print(f"Verified {example['id']} fixture: {example_plot.area:.2f} m², OSM way {example['roadId']}, scenario width {example['widthM']} m")
+        manifest = read_json(public / "manifest.json")
+        for filename, info in manifest["bundledFiles"].items():
+            payload = (public / filename).read_bytes()
+            assert info["bytes"] == len(payload) and info["sha256"] == hashlib.sha256(payload).hexdigest()
+        print(f"Verified exact sourced zone geometry, {project(zone).area / 1e6:.4f} km²; compiled asset hashes match")
+    else:
+        assert zone.covers(coverage)
     assert project(coverage).covers(parcel)
     assert parcel.is_valid and isclose(parcel.area, 828, abs_tol=1e-5)
     assert len(parcel.exterior.coords) == 9
@@ -91,7 +114,7 @@ def check_saved_site(evidence: Path, public: Path) -> None:
     overlap = wide_right_of_way.intersection(parcel).area
     assert isclose(overlap, 45, abs_tol=1e-5)
     print(f"Verified default parcel: {parcel.area:.2f} m², {frontage.length:.2f} m modeled frontage")
-    print(f"Verified study box is {project(zone).boundary.distance(project(coverage)):.2f} m from zone edge")
+    print(f"Verified original study box is {project(zone).boundary.distance(project(original_study)):.2f} m from zone edge")
     print(f"At 14.7 m what-if ROW the original parcel stays fixed and ROW overlaps {overlap:.2f} m²")
 
 

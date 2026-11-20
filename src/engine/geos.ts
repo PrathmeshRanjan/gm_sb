@@ -94,6 +94,18 @@ export class GeometryScope {
     return this.geos.GEOSisValid(geometry) === 1;
   }
 
+  covers(container: NativeGeometry, candidate: NativeGeometry) {
+    const result = this.geos.GEOSCovers(container, candidate);
+    if (result === 2) throw new Error('GEOS could not evaluate containment.');
+    return result === 1;
+  }
+
+  intersects(first: NativeGeometry, second: NativeGeometry) {
+    const result = this.geos.GEOSIntersects(first, second);
+    if (result === 2) throw new Error('GEOS could not evaluate intersection.');
+    return result === 1;
+  }
+
   intersection(a: NativeGeometry, b: NativeGeometry) {
     return this.own(this.geos.GEOSIntersection(a, b));
   }

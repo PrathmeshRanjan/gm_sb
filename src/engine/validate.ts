@@ -1,6 +1,6 @@
 import type { Position } from 'geojson';
 import type { Prepared } from './context';
-import { fromRoadReference } from './envelope';
+import { floorEnvelopes, fromRoadReference } from './envelope';
 import type { NativeFloor } from './envelope';
 import type { NativeGeometry } from './geos';
 import {
@@ -135,7 +135,17 @@ export function checkConcept(
   const footprint = scope.write(floors[0].geometry);
   const frontage = footprint?.type === 'Polygon' ? facingFacade(footprint.coordinates[0], frame.nearX) : null;
   const qualifiesRoadFacing = !!frontage && frontage.longest > frontage.perimeter / 8;
+  // BMA §52(6) exempts residential buildings of at most three storeys. For
+  // taller supported residential buildings, only §53's roadside branch is
+  // implemented. Nonqualification requires a different access design.
   const localFrontageTrigger = floors.length > 3;
+  let maxEnvelopeExcess = Infinity;
+  if (!floorOverlap && allValid && floors.every(({ baseM, topM }) => Number.isFinite(baseM) && Number.isFinite(topM))) {
+    maxEnvelopeExcess = scope.temporary(() => {
+      const model = floorEnvelopes(ctx, floors.length, gfa, false, floors);
+      return Math.max(...floors.map(({ geometry }, i) => scope.area(scope.difference(geometry, model.floors[i].geometry))));
+    });
+  }
   const frontCheck = (key: 'national' | 'local', limit: RoadLimit): RuleResult => {
     const actual = limit?.reference === 'near-edge' ? minNearOffset : minCenterOffset;
     return rule(
@@ -173,6 +183,10 @@ export function checkConcept(
     rule('plot', 'Plot containment and support', 'แนวเขตที่ดิน', 'Geometry check', PLAN,
       status(allValid && maxExcess <= GEOMETRY_AREA_TOLERANCE && supportError <= GEOMETRY_AREA_TOLERANCE),
       'scenario', `${square(maxExcess)} outside the plot. ${square(supportError)} unsupported above another plate.`),
+    rule('applicable-envelope', 'Containment in the applicable floor slices', 'ขอบเขตที่อนุญาต', 'Independent geometry check', '',
+      status(maxEnvelopeExcess <= GEOMETRY_AREA_TOLERANCE), 'scenario', Number.isFinite(maxEnvelopeExcess)
+        ? `Maximum ${maxEnvelopeExcess.toFixed(6)} m² outside a matching slice, using full polygon differences, actual floor elevations and measured GFA. Modeled area tolerance: ${GEOMETRY_AREA_TOLERANCE} m².`
+        : 'At least one floor is invalid or has inconsistent elevations; containment could not be evaluated.'),
     frontCheck('national', fronts.national),
     frontCheck('local', fronts.local),
     rule('street-overlap', 'Building outside model right-of-way', 'ที่สาธารณะ', 'MR55 §40', NATIONAL,
@@ -238,10 +252,14 @@ export function checkConcept(
       `${floors.length}/${profile.maxFloors} model storeys. ${profile.gfaLimit === null ? 'No product GFA cap for this house profile.' : `${square(gfa)} of ${square(profile.gfaLimit)} product cap.`}`,
       profile.gfaLimit !== null && Math.abs(profile.gfaLimit - gfa) <= 0.1),
     rule('frontage', 'Public-road-facing façade', 'แนวอาคารด้านที่ประชิดติดริมทางสาธารณะ', 'BMA §§52(6), 53', BANGKOK,
-      !localFrontageTrigger ? 'not-applicable' : qualifiesRoadFacing && road!.frontageM > 0 ? 'pass' : 'review',
-      road!.frontageM > 0 ? 'scenario' : 'unknown',
+      !localFrontageTrigger ? 'not-applicable' : status(qualifiesRoadFacing), 'scenario',
       !localFrontageTrigger ? 'The supported low residential form does not trigger this frontage branch.'
-        : `${meters(frontage?.longest ?? 0)} qualifying façade within 20 m, against more than ${meters((frontage?.perimeter ?? 0) / 8)}. ${meters(road!.frontageM)} modeled plot contact. Confirm the public access, or assess the alternative frontage and internal access provisions.`),
+        : `${meters(frontage?.longest ?? 0)} qualifying façade within 20 m, against more than ${meters((frontage?.perimeter ?? 0) / 8)}. ${meters(road!.frontageM)} modeled plot contact. ${qualifiesRoadFacing ? 'Qualifies geometrically for the supported roadside branch, conditional on public access.' : 'Does not qualify for the modeled §53 roadside exemption. An alternative may be lawful, but is outside the automatic model.'}`),
+    rule('frontage-public-access', 'Legal public road and access evidence', 'ทางสาธารณะ', 'BMA §§52(6), 53', BANGKOK,
+      'review', input.road.publicStatus === 'documented' && road!.frontageM > 0 ? 'scenario' : 'unknown',
+      `${meters(road!.frontageM)} modeled plot contact. A geometric result assumes legal adjacency and public access; verify the road boundary, road status and access rights independently.`),
+    ...(localFrontageTrigger && !qualifiesRoadFacing ? [rule('frontage-alternative', 'Alternative frontage and internal access', 'ที่ว่างด้านหน้าและถนนภายใน', 'BMA §52(6)', BANGKOK,
+      'review', 'unknown', 'A taller residential building failing the supported §53 roadside qualification requires separate analysis of the 12 m front open space, a continuous length of at least one-sixth of exterior perimeter, and a 6 m internal road connecting to the public road. This branch is not implemented and the candidate is not accepted by the automatic search.')] : []),
     rule('retained', 'Existing buildings and clearance', 'ระยะห่างระหว่างอาคาร', 'MR55 §48 · 2013 plan §4', NATIONAL,
       input.redevelopment === 'retain' && (retainedCollision > GEOMETRY_AREA_TOLERANCE
         || retainedClearance + DISTANCE_TOLERANCE < 6) ? 'fail' : 'review',

@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bangkok Site Study V4 — browser verification</title>
+<style>
+  * { box-sizing: border-box }
+  body { margin: 0; background: #f4f6f2; color: #17362b; font: 16px/1.5 system-ui, sans-serif }
+  main { max-width: 78rem; padding: 2.5rem 1.25rem 4rem; margin: auto }
+  a { color: #185e48 }
+  h1 { margin: 1rem 0 .35rem; font-size: clamp(2rem, 3.7vw, 3rem); line-height: 1.1 }
+  h2 { margin-top: 2.5rem; font-size: 1.5rem }
+  p { max-width: 56rem }
+  section { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 28rem), 1fr)); gap: 1.25rem }
+  figure { margin: 0; overflow: hidden; border: 1px solid #d4dfd6; border-radius: .65rem; background: white }
+  img { display: block; width: 100%; aspect-ratio: 1440 / 980; object-fit: contain }
+  figcaption { padding: .75rem 1rem; font-weight: 650 }
+</style>
+<main>
+  <a href="../../">Open Bangkok Site Study</a> · <a href="../">Earlier V3 verification</a>
+  <h1>V4 browser verification</h1>
+  <p>Actual screenshots of the V4 production build run locally in headed Chromium with Apple M1 hardware WebGL. The three examples have actual mapped road/building context, authored parcels, and hypothetical right-of-way widths. The screenshots show the after-edit results. Open any image at full size to inspect the controls and calculations.</p>
+  <h2>Southwest — Soi Pracha Songkhro 21 Yaek 6-1-6</h2>
+  <section>
+    <figure><a href="southwest-edited.jpg"><img loading="lazy" src="southwest-edited.jpg" alt="Edited southwest parcel in plan view" /></a><figcaption>Road selection and parcel edit</figcaption></figure>
+    <figure><a href="southwest-wide.jpg"><img loading="lazy" src="southwest-wide.jpg" alt="Southwest wider design in neighborhood" /></a><figcaption>Wider concept</figcaption></figure>
+    <figure><a href="southwest-alternative.jpg"><img loading="lazy" src="southwest-alternative.jpg" alt="Southwest compact garden design" /></a><figcaption>Compact garden alternative</figcaption></figure>
+    <figure><a href="southwest-checks.jpg"><img loading="lazy" src="southwest-checks.jpg" alt="Southwest selected design schedule" /></a><figcaption>Floor schedule and checks</figcaption></figure>
+  </section>
+  <h2>North — Soi Inthamara 28</h2>
+  <section>
+    <figure><a href="north-edited.jpg"><img loading="lazy" src="north-edited.jpg" alt="North trapezoidal plot in editing mode" /></a><figcaption>Road selection and parcel edit</figcaption></figure>
+    <figure><a href="north-wide.jpg"><img loading="lazy" src="north-wide.jpg" alt="North wider design in real context" /></a><figcaption>Wider concept</figcaption></figure>
+    <figure><a href="north-alternative.jpg"><img loading="lazy" src="north-alternative.jpg" alt="North compact garden design" /></a><figcaption>Compact garden alternative</figcaption></figure>
+    <figure><a href="north-checks.jpg"><img loading="lazy" src="north-checks.jpg" alt="North floor schedule" /></a><figcaption>Floor schedule and checks</figcaption></figure>
+  </section>
+  <h2>East — Soi Inthamara 47</h2>
+  <section>
+    <figure><a href="east-edited.jpg"><img loading="lazy" src="east-edited.jpg" alt="East concave plot in vertex editing mode" /></a><figcaption>Road selection and parcel edit</figcaption></figure>
+    <figure><a href="east-wide.jpg"><img loading="lazy" src="east-wide.jpg" alt="East wider multifamily design" /></a><figcaption>Wider concept</figcaption></figure>
+    <figure><a href="east-alternative.jpg"><img loading="lazy" src="east-alternative.jpg" alt="East stepped multifamily design" /></a><figcaption>Stepped alternative</figcaption></figure>
+    <figure><a href="east-checks.jpg"><img loading="lazy" src="east-checks.jpg" alt="East floor schedule and precise rounded total" /></a><figcaption>Floor schedule and checks</figcaption></figure>
+  </section>
+  <h2>Baseline and eligibility</h2>
+  <section>
+    <figure><a href="wide.jpg"><img loading="lazy" src="wide.jpg" alt="Baseline two-floor concept and selected envelope" /></a><figcaption>Pracha Suk wider / two floors</figcaption></figure>
+    <figure><a href="stepped.jpg"><img loading="lazy" src="stepped.jpg" alt="Baseline six-floor concept and selected envelope" /></a><figcaption>Pracha Suk stepped / six floors</figcaption></figure>
+    <figure><a href="capacity.jpg"><img loading="lazy" src="capacity.jpg" alt="Baseline geometric capacity and separate selected envelope controls" /></a><figcaption>Capacity and concept-specific envelope</figcaption></figure>
+    <figure><a href="height-plane-stress.jpg"><img loading="lazy" src="height-plane-stress.jpg" alt="Road width stress case" /></a><figcaption>Height-plane stress</figcaption></figure>
+    <figure><a href="numerical-checks.jpg"><img loading="lazy" src="numerical-checks.jpg" alt="Conservative clearance measurement and tolerance" /></a><figcaption>Clearance, margin and tolerance</figcaption></figure>
+    <figure><a href="floor-schedule.jpg"><img loading="lazy" src="floor-schedule.jpg" alt="Actual plate schedule and independent rounding total" /></a><figcaption>Floor-area precision</figcaption></figure>
+    <figure><a href="outside-zone.jpg"><img loading="lazy" src="outside-zone.jpg" alt="Outside-zone rejection with zoning line" /></a><figcaption>Outside the statutory zone</figcaption></figure>
+    <figure><a href="water-screening.jpg"><img loading="lazy" src="water-screening.jpg" alt="Water screening overlay, unsupported site condition" /></a><figcaption>Mapped water requires site review</figcaption></figure>
+    <figure><a href="unsupported-site.jpg"><img loading="lazy" src="unsupported-site.jpg" alt="Missing road width and explicit unsupported site" /></a><figcaption>Width unavailable</figcaption></figure>
+  </section>
+</main>
+</html>

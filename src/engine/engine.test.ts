@@ -179,6 +179,103 @@ describe('legal applicability and independent checks', () => {
     }
   });
 
+  it('finds a second house on the confirmed narrow lot and independently checks both alternatives', async () => {
+    const narrowHouse = fixture(box(0, 0, 6.6, 14), 'house');
+    const result = await calculateScenario(narrowHouse);
+    expect(result.validation).toBe('valid');
+    expect(result.plotAreaM2).toBeCloseTo(92.4, 5);
+    expect(result.concepts.map(({ id }) => id)).toEqual(['wide', 'stepped']);
+    const [wide, compact] = result.concepts;
+    expect(wide.gfaM2).toBeCloseTo(91.83056, 4);
+    expect(compact.gfaM2).toBeLessThan(wide.gfaM2);
+    expect(compact.coveredM2).toBeLessThan(wide.coveredM2 * 0.85);
+    for (const concept of result.concepts) {
+      expect(Math.min(...concept.floors.map(({ areaM2 }) => areaM2))).toBeGreaterThanOrEqual(27);
+      const audit = await validateGeneratedConcept(narrowHouse, concept);
+      expect(audit.filter(({ status }) => status === 'fail')).toEqual([]);
+      await withGeos((scope) => {
+        for (const floor of concept.floors) {
+          const geometry = scope.read(mapArea(floor.geometry, frame.toLocal));
+          expect(scope.area(scope.buffer(geometry, -2))).toBeGreaterThanOrEqual(0.15);
+        }
+      });
+    }
+    // Reproduce both counterexamples supplied in the review, with 55% of
+    // the remaining open land reserved in separate planted strips.
+    for (const [plate, lowerY, upperY, area] of [
+      [box(0.1, 3, 4.3, 10), 3, 10, 29.4],
+      [box(0.1, 2.5, 4.3, 10.5), 2.5, 10.5, 33.6],
+    ] as const) {
+      const upperPlantLength = ((92.4 - area) * 0.55 - 6.6 * lowerY) / 6.6;
+      const planting = {
+        type: 'MultiPolygon' as const,
+        coordinates: [world(box(0, 0, 6.6, lowerY)).coordinates,
+          world(box(0, upperY, 6.6, upperY + upperPlantLength)).coordinates],
+      };
+      const audit = await validateGeneratedConcept(narrowHouse, { ...slabConcept(plate, 2, area), planting });
+      expect(audit.filter(({ status }) => status === 'fail')).toEqual([]);
+    }
+  });
+
+  it('distinguishes an empty envelope from exhaustion of a nonempty search', async () => {
+    const insufficientDepth = await calculateScenario(fixture(box(0, 0, 3.8, 24)));
+    expect(insufficientDepth.validation).toBe('valid');
+    expect(insufficientDepth.capacity!.geometricGfaUpperBoundM2).toBeGreaterThan(0);
+    expect(insufficientDepth.concepts).toHaveLength(0);
+    expect(insufficientDepth.conceptMessages.wide).toContain('bounded search');
+    expect(insufficientDepth.conceptMessages.stepped).toContain('Other forms may fit');
+  });
+
+  it('checks the actual per-concept envelope, not the six-floor capacity classification', async () => {
+    const result = await calculateScenario(preset);
+    const [wide, stepped] = result.concepts;
+    expect(result.boundExplanation!.floorCount).toBe(6);
+    expect(wide.envelopeExplanation!.floorCount).toBe(2);
+    expect(wide.envelopeExplanation!.heightM).toBe(wide.heightM);
+    expect(stepped.envelopeExplanation!.floorCount).toBe(6);
+    expect(wide.envelopeRules!.find(({ id }) => id === 'national-private')?.detail).toContain('Uses 2 m');
+    expect(stepped.envelopeRules!.find(({ id }) => id === 'national-private')?.detail).toContain('Uses 3 m');
+    await withGeos((scope) => {
+      for (const concept of result.concepts) {
+        expect(concept.envelope!.length).toBe(concept.floors.length);
+        for (const floor of concept.floors) {
+          const slice = concept.envelope!.find(({ floor: number }) => number === floor.floor)!;
+          expect(slice.topM).toBe(floor.topM);
+          const plate = scope.read(mapArea(floor.geometry, project));
+          const envelope = scope.read(mapArea(slice.geometry, project));
+          expect(scope.area(scope.difference(plate, envelope))).toBeLessThanOrEqual(0.00001);
+        }
+      }
+      const wideGround = scope.read(mapArea(wide.floors[0].geometry, project));
+      const capacityGround = scope.read(mapArea(result.envelope[0].geometry, project));
+      expect(scope.area(scope.difference(wideGround, capacityGround))).toBeGreaterThan(90);
+    });
+  });
+
+  it('separates a calculated roadside qualification from legal access and the unsupported alternative', async () => {
+    const site = fixture(box(0, 0, 50, 32), 'multifamily');
+    const remote = { ...slabConcept(box(24, 10, 34, 20), 4, 100), planting: world(box(0.1, 0.1, 23.9, 31.9)) };
+    const roadside = { ...slabConcept(box(5, 10, 15, 20), 4, 100), planting: world(box(16, 0.1, 49.9, 31.9)) };
+    const [remoteAudit, roadsideAudit] = await Promise.all([
+      validateGeneratedConcept(site, remote), validateGeneratedConcept(site, roadside),
+    ]);
+    expect(remoteAudit.find(({ id }) => id === 'frontage')?.status).toBe('fail');
+    expect(remoteAudit.filter(({ status }) => status === 'fail').map(({ id }) => id)).toEqual(['frontage']);
+    expect(remoteAudit.find(({ id }) => id === 'frontage-alternative')?.status).toBe('review');
+    expect(remoteAudit.find(({ id }) => id === 'frontage-alternative')?.detail).toContain('not implemented');
+    expect(roadsideAudit.find(({ id }) => id === 'frontage')?.status).toBe('pass');
+    expect(roadsideAudit.find(({ id }) => id === 'frontage-public-access')?.status).toBe('review');
+    expect(roadsideAudit.find(({ id }) => id === 'frontage-alternative')).toBeUndefined();
+    expect(roadsideAudit.filter(({ status }) => status === 'fail')).toEqual([]);
+    const uncertainRoad = await validateGeneratedConcept({ ...site, road: { ...site.road, publicStatus: 'unknown' } }, roadside);
+    expect(uncertainRoad.find(({ id }) => id === 'frontage')?.status).toBe('pass');
+    expect(uncertainRoad.find(({ id }) => id === 'frontage-public-access')).toMatchObject({ status: 'review', evidence: 'unknown' });
+    const [wide, stepped] = (await calculateScenario(preset)).concepts;
+    expect(wide.checks.find(({ id }) => id === 'frontage')?.status).toBe('not-applicable');
+    expect(stepped.checks.find(({ id }) => id === 'frontage')?.status).toBe('pass');
+    expect(stepped.siteEvidence.find(({ id }) => id === 'frontage-public-access')?.status).toBe('review');
+  });
+
   it('keeps exterior building remainders and handles verified eligible retained GFA', async () => {
     const parcel = fixture(box(0, 0, 32, 30), 'multifamily');
     const footprint = mapArea(box(28, 45, 41, 50), ([x, y]) => frame.toWorld([x, y]));
