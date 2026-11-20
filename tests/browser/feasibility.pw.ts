@@ -2,9 +2,10 @@ import { mkdir, readdir, readFile } from 'node:fs/promises';
 import { expect, test, type Page } from '@playwright/test';
 import type { Polygon } from 'geojson';
 import proj4 from 'proj4';
-import type { CalculateResponse, ScenarioInput } from '../../src/engine/types';
+import type { CalculateRequest, CalculateResponse, ScenarioInput, ScenarioResult } from '../../src/engine/types';
 import { nearbyBuildings, roadsForPlot, type ContextData } from '../../src/context';
 import { roadFrame } from '../../src/engine/spatial';
+import { validateGeneratedConcept } from '../../src/engine';
 
 const utm = '+proj=utm +zone=47 +datum=WGS84 +units=m +no_defs';
 const origin = proj4('WGS84', utm, [100.5658, 13.7844]);
@@ -31,10 +32,89 @@ const syntheticBase: ScenarioInput = {
 };
 
 async function capture(page: Page, name: string) {
-  const prefix = process.env.FEASIBILITY_URL ? 'v4-live' : 'v4-candidate';
+  const prefix = process.env.FEASIBILITY_URL ? 'final-live' : 'final-candidate';
   await mkdir('artifacts', { recursive: true });
   await page.screenshot({ path: `artifacts/${prefix}-${name}.png`, animations: 'disabled' });
 }
+
+test('the loaded east example sends saved coordinates and the production worker is stable at nine decimals', async ({ page }) => {
+  type Captured = { id: number; input: ScenarioInput; response?: CalculateResponse };
+  const browserAudit = '__eastNumericalAudit';
+  await page.addInitScript((auditKey) => {
+    const records: Captured[] = [];
+    Object.assign(window, { [auditKey]: records });
+    const NativeWorker = window.Worker;
+    window.Worker = class extends NativeWorker {
+      private readonly geometry: boolean;
+      constructor(url: string | URL, options?: WorkerOptions) {
+        super(url, options);
+        this.geometry = String(url).includes('geometry.worker');
+        if (this.geometry) this.addEventListener('message', ({ data }: MessageEvent<CalculateResponse>) => {
+          const record = records.find(({ id }) => id === data.id);
+          if (record) record.response = data;
+        });
+      }
+      postMessage(message: unknown, options?: StructuredSerializeOptions) {
+        const request = message as CalculateRequest;
+        if (this.geometry && request.input) records.push({ id: request.id, input: structuredClone(request.input) });
+        super.postMessage(message, options);
+      }
+    };
+  }, browserAudit);
+  const context = await readContext();
+  const east = context.site.examples!.find(({ id }) => id === 'east')!;
+  await page.goto('');
+  await expect(page.getByTestId('result-ready')).toHaveAttribute('data-state', 'valid');
+  await page.getByTestId('road-location').selectOption('example:east');
+  await page.getByTestId('load-location-example').click();
+  await expect(page.getByTestId('result-ready')).toHaveAttribute('data-road-id', '25902874');
+  await expect(page.getByTestId('result-ready')).toHaveAttribute('data-state', 'valid');
+  const captured = await page.evaluate((auditKey) => (window as unknown as Record<string, Captured[]>)[auditKey]
+    .filter(({ input, response }) => input.road.id === '25902874' && response && 'result' in response).at(-1)!, browserAudit);
+  expect(captured.input.plot).toEqual(east.parcel);
+  expect(captured.input.road.widthM).toBe(8);
+  expect(captured.input.redevelopment).toBe('clear');
+  expect(captured.input.frontageEdgeIndex).toBeUndefined();
+  const exact = (captured.response as { result: ScenarioResult }).result;
+  const roundedInput: ScenarioInput = { ...captured.input, plot: { ...east.parcel,
+    coordinates: east.parcel.coordinates.map((ring) => ring.map((point) => point.map((value) => Number(value.toFixed(9))))) } };
+  const worker = (await readdir('dist/assets')).find((file) => /^geometry\.worker-.+\.js$/.test(file))!;
+  const rounded = await page.evaluate(({ path, input }) => new Promise<ScenarioResult>((resolve, reject) => {
+    const worker = new Worker(path, { type: 'module' });
+    worker.onmessage = ({ data }: MessageEvent<CalculateResponse>) => {
+      worker.terminate();
+      if ('result' in data) resolve(data.result); else reject(new Error(data.error));
+    };
+    worker.onerror = (error) => { worker.terminate(); reject(new Error(error.message)); };
+    worker.postMessage({ id: 9999, input });
+  }), { path: new URL(`assets/${worker}`, page.url()).href, input: roundedInput });
+  for (const [index, result] of [exact, rounded].entries()) {
+    expect(result.concepts.map(({ id }) => id)).toEqual(['wide', 'stepped']);
+    expect(result.concepts[1].coveredM2).toBeLessThan(result.concepts[0].coveredM2 * 0.9);
+    for (const concept of result.concepts) {
+      expect(concept.checks.some(({ status }) => status === 'fail')).toBe(false);
+      const independentlyChecked = await validateGeneratedConcept(index === 0 ? captured.input : roundedInput, concept);
+      expect(independentlyChecked.some(({ status }) => status === 'fail')).toBe(false);
+    }
+  }
+  for (const [index, concept] of exact.concepts.entries()) {
+    expect(Math.abs(concept.gfaM2 - rounded.concepts[index].gfaM2)).toBeLessThan(0.01);
+    await expect(page.getByTestId(`concept-${concept.id}`)).toContainText(concept.gfaM2.toFixed(2));
+  }
+  console.log('East original loaded worker audit', JSON.stringify({
+    exact: { plotM2: exact.plotAreaM2, gfa: exact.concepts.map(c => c.gfaM2) },
+    rounded: { plotM2: rounded.plotAreaM2, gfa: rounded.concepts.map(c => c.gfaM2) },
+    savedCoordinatesMatch: true,
+  }));
+  await page.getByTestId('view-3d').click();
+  await page.getByRole('button', { name: 'Zoom in' }).click();
+  for (const concept of exact.concepts) {
+    await page.getByTestId(`concept-${concept.id}`).click();
+    await expect(page.getByTestId('site-map')).toHaveAttribute('data-concept-id', concept.id);
+    await page.waitForTimeout(500);
+    await capture(page, `east-original-${concept.id}`);
+  }
+});
 
 async function readContext(): Promise<ContextData> {
   const [site, buildings, roads] = await Promise.all(['site.json', 'buildings.geojson', 'roads.geojson'].map(async (name) => JSON.parse(await readFile(`public/data/${name}`, 'utf8'))));

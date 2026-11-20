@@ -1,13 +1,13 @@
 import type { Polygon } from 'geojson';
-import { clipRoadSide, worldGeometry } from './context';
+import { clipRoadSide, serializeAreaForAudit } from './context';
 import type { Prepared } from './context';
 import { floorEnvelopes } from './envelope';
 import type { NativeFloor } from './envelope';
 import type { NativeGeometry } from './geos';
-import { FAR, OSR, PROFILES } from './rules';
+import { BUDGET_TOLERANCE, FAR, GEOMETRY_AREA_TOLERANCE, OSR, PROFILES } from './rules';
 import { box, extent, mapArea, points } from './spatial';
 import type { XY } from './spatial';
-import type { Concept, Strategy } from './types';
+import type { AreaGeometry, Concept, Strategy } from './types';
 import { checkConcept } from './validate';
 
 type RatedDesign = {
@@ -15,6 +15,8 @@ type RatedDesign = {
   family: string;
   gfaM2: number;
   footprintM2: number;
+  bandCap: number;
+  footprintTargetM2: number;
 };
 type StepPattern = { label: string; fromFloor: number; every: number; fraction: number } | null;
 
@@ -103,17 +105,35 @@ function plantingGeometry(ctx: Prepared, ground: NativeFloor) {
 
 function proposal(ctx: Prepared, strategy: Strategy, candidate: RatedDesign, other?: Concept): { concept: Concept | null; frontageFailure: boolean } {
   const { scope, input } = ctx;
-  const planting = plantingGeometry(ctx, candidate.floors[0]);
-  const audit = checkConcept(ctx, candidate.floors, planting);
+  const rejected = { concept: null, frontageFailure: false };
+  const converted = new Map<NativeGeometry, NonNullable<ReturnType<typeof serializeAreaForAudit>>>();
+  const auditFloors: NativeFloor[] = [];
+  const worldFloors: AreaGeometry[] = [];
+  for (const floor of candidate.floors) {
+    const serialized = converted.get(floor.geometry) ?? serializeAreaForAudit(ctx, floor.geometry);
+    if (!serialized || !scope.isPolygon(serialized.local)) return rejected;
+    converted.set(floor.geometry, serialized);
+    auditFloors.push({ ...floor, geometry: serialized.local });
+    worldFloors.push(serialized.world);
+  }
+  const planting = plantingGeometry(ctx, auditFloors[0]);
+  const serializedPlanting = planting ? serializeAreaForAudit(ctx, planting) : null;
+  if (planting && !serializedPlanting) return rejected;
+  // The returned geographic coordinates are the proposal. Recompute every
+  // check and quantity from their reprojected geometry, including planting.
+  const audit = checkConcept(ctx, auditFloors, serializedPlanting?.local ?? null);
   if (audit.checks.some((check) => check.status === 'fail')) return {
     concept: null, frontageFailure: audit.checks.some(({ id, status }) => id === 'frontage' && status === 'fail'),
   };
-  const geometryForPlanting = planting ? scope.write(planting) : null;
+  const profile = PROFILES[input.profile];
+  if (audit.gfa > candidate.bandCap + BUDGET_TOLERANCE
+      || audit.areas[0] > candidate.footprintTargetM2 + GEOMETRY_AREA_TOLERANCE
+      || Math.min(...audit.areas) < profile.minArea
+      || scope.temporary(() => scope.area(scope.buffer(auditFloors.at(-1)!.geometry, -profile.minDepth / 2))) < 0.15) return rejected;
   const tightChecks = audit.checks.filter(({ controls }) => controls).map(({ label }) => label);
   const limitingFactors = tightChecks.length
     ? [`Closest modeled constraints: ${tightChecks.join(', ')}.`]
     : ['The selected plates have slack against the modeled geometric checks.'];
-  const profile = PROFILES[input.profile];
   if (profile.gfaLimit !== null) {
     const gap = profile.gfaLimit - audit.gfa;
     limitingFactors.push(`${sqm(gap)} below the ${sqm(profile.gfaLimit)} application cap. The cap bounds the search.`);
@@ -124,15 +144,15 @@ function proposal(ctx: Prepared, strategy: Strategy, candidate: RatedDesign, oth
     id: strategy,
     name: strategy === 'stepped' && Math.max(...audit.areas) - Math.min(...audit.areas) < 0.01
       ? 'Compact garden form' : CONFIG[strategy].name,
-    floors: candidate.floors.map(({ floor, baseM, topM, geometry }, i) => ({
-      floor, baseM, topM, areaM2: audit.areas[i], geometry: worldGeometry(ctx, scope.write(geometry)!),
+    floors: auditFloors.map(({ floor, baseM, topM }, i) => ({
+      floor, baseM, topM, areaM2: audit.areas[i], geometry: worldFloors[i],
     })),
     heightM: audit.height,
     gfaM2: audit.gfa,
     coveredM2: audit.coveredArea,
     openM2: audit.openArea,
     perviousM2: audit.planted,
-    planting: geometryForPlanting && worldGeometry(ctx, geometryForPlanting),
+    planting: serializedPlanting?.world ?? null,
     checks: audit.checks,
     siteEvidence: audit.siteEvidence,
     rationale: strategy === 'wide'
@@ -176,7 +196,8 @@ export function generateDesign(ctx: Prepared, strategy: Strategy, other?: Concep
         if (!ground || scope.area(envelopes.at(-1)!.geometry) < profile.minArea) continue;
         const groundArea = scope.area(envelopes[0].geometry);
         const perFloorTarget = bandCap / (count * (strategy === 'stepped' ? 0.87 : 1));
-        const maxFootprint = Math.min(groundArea, ctx.plotArea * 0.7, other ? other.floors[0].areaM2 * 0.85 : Infinity);
+        const footprintTargetM2 = Math.min(ctx.plotArea * 0.7, other ? other.floors[0].areaM2 * 0.85 : Infinity);
+        const maxFootprint = Math.min(groundArea, footprintTargetM2);
         const target = Math.min(perFloorTarget, maxFootprint);
         if (target < profile.minArea) continue;
         const patterns: StepPattern[] = fallback ? [null] : strategy === 'stepped'
@@ -224,8 +245,12 @@ export function generateDesign(ctx: Prepared, strategy: Strategy, other?: Concep
           if (!floors) continue;
           const gfaM2 = floors.reduce((sum, floor) => sum + scope.area(floor.geometry), 0);
           const footprintM2 = scope.area(floors[0].geometry);
-          if (!planningBudget(ctx, gfaM2, footprintM2, bandCap) || footprintM2 > maxFootprint) continue;
-          screened.push({ floors, gfaM2, footprintM2,
+          // An intersection cannot materially exceed its parent envelope. The
+          // geometric comparison permits only the existing 1e-5 m² area
+          // tolerance; actual planning budgets and search targets stay separate.
+          if (!planningBudget(ctx, gfaM2, footprintM2, bandCap)
+              || footprintM2 > groundArea + GEOMETRY_AREA_TOLERANCE || footprintM2 > footprintTargetM2) continue;
+          screened.push({ floors, gfaM2, footprintM2, bandCap, footprintTargetM2,
             family: steps && count >= steps.fromFloor ? `${seed.label} with ${steps.label}` : seed.label });
         }
       }

@@ -122,6 +122,10 @@ export class GeometryScope {
     return this.own(this.geos.GEOSBufferWithStyle(geometry, distance, quadrantSegments, 1, 2, 4));
   }
 
+  removeRepeatedPoints(geometry: NativeGeometry, tolerance: number) {
+    return this.own(this.geos.GEOSRemoveRepeatedPoints(geometry, tolerance));
+  }
+
   clearanceBand(geometry: NativeGeometry, required: number) {
     const quadrantSegments = 16;
     // GEOS round caps are inscribed chords. Inflate their apothem to the required

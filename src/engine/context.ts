@@ -1,6 +1,6 @@
 import type { MultiLineString, Polygon, Position } from 'geojson';
 import type { GeometryScope, NativeGeometry } from './geos';
-import { AREA_TOLERANCE, ROAD_ALIGNMENT_TOLERANCE } from './rules';
+import { AREA_TOLERANCE, GEOMETRY_AREA_TOLERANCE, ROAD_ALIGNMENT_TOLERANCE } from './rules';
 import { box, extent, line, mapArea, points, project, roadFrame } from './spatial';
 import type { AreaGeometry, ScenarioInput, ScenarioResult } from './types';
 import { STUDY_BBOX } from './types';
@@ -217,4 +217,21 @@ export function clipRoadSide(ctx: Prepared, envelope: NativeGeometry, atX: numbe
 
 export function worldGeometry(ctx: Prepared, geometry: AreaGeometry) {
   return mapArea(geometry, ctx.frame.toWorld);
+}
+
+/** Serialize generated polygonal geometry without changing any user input. */
+export function serializeAreaForAudit(ctx: Prepared, geometry: NativeGeometry): { world: AreaGeometry; local: NativeGeometry } | null {
+  const { scope } = ctx;
+  if (!scope.valid(geometry)) return null;
+  // Only consecutive points within 10 nanometres are removed. There is no
+  // arbitrary topology repair, snapping of the parcel, or clearance change.
+  const cleaned = scope.removeRepeatedPoints(geometry, 1e-8);
+  if (!scope.valid(cleaned)) return null;
+  const shape = scope.write(cleaned);
+  if (!shape) return null;
+  const world = worldGeometry(ctx, shape);
+  if (!scope.valid(scope.read(world))) return null;
+  const local = scope.read(mapArea(world, ctx.frame.toLocal));
+  if (!scope.valid(local) || Math.abs(scope.area(local) - scope.area(geometry)) > GEOMETRY_AREA_TOLERANCE) return null;
+  return { world, local };
 }

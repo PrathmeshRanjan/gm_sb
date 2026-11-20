@@ -102,20 +102,26 @@ describe('published geographic scenarios', () => {
     roads: JSON.parse(readFileSync(new URL('../../public/data/roads.geojson', import.meta.url), 'utf8')),
   };
 
+  function exampleInput(example: NonNullable<ContextData['site']['examples']>[number], plot = example.parcel): ScenarioInput {
+    const roads = roadsForPlot(plot, context);
+    const selected = roads.find((road) => String(road.wayId) === String(example.roadId))!;
+    expect(selected).toBeDefined();
+    return {
+      plot, profile: example.profile, redevelopment: 'clear',
+      zoneBoundary: context.site.zoneBoundary, contextCoverage: context.site.coverage,
+      screeningCoverage: context.site.screeningCoverage, screeningAreas: context.site.screeningAreas,
+      roadSelectionAvailable: true,
+      nearbyRoads: roads.map((road) => ({ id: String(road.wayId), name: road.name, centerline: road.mappedCenterline, widthM: road.width ?? undefined, roadClass: road.roadClass })),
+      retainedBuildings: nearbyBuildings(plot, context.buildings),
+      road: { id: String(selected.wayId), sameRoadIds: selected.sameRoadIds, name: selected.name,
+        roadClass: selected.roadClass, sourceUrl: selected.sourceUrl, centerline: selected.centerline,
+        widthM: example.widthM, widthSource: 'user-override', publicStatus: 'unknown' },
+    };
+  }
+
   for (const example of context.site.examples ?? []) {
     it(`uses actual nearby roads and independently fitting alternatives for ${example.id}`, async () => {
-      const roads = roadsForPlot(example.parcel, context);
-      const selected = roads.find((road) => String(road.wayId) === String(example.roadId));
-      expect(selected).toBeDefined();
-      const input: ScenarioInput = {
-        plot: example.parcel, profile: example.profile, redevelopment: 'clear',
-        zoneBoundary: context.site.zoneBoundary, contextCoverage: context.site.coverage,
-        screeningCoverage: context.site.screeningCoverage, screeningAreas: context.site.screeningAreas,
-        nearbyRoads: roads.map((road) => ({ id: String(road.wayId), name: road.name, centerline: road.mappedCenterline, widthM: road.width ?? undefined, roadClass: road.roadClass })),
-        retainedBuildings: nearbyBuildings(example.parcel, context.buildings),
-        road: { id: String(selected!.wayId), sameRoadIds: selected!.sameRoadIds, name: selected!.name,
-          centerline: selected!.centerline, widthM: example.widthM, widthSource: 'user-override', publicStatus: 'unknown' },
-      };
+      const input = exampleInput(example);
       const result = await calculateScenario(input);
       console.log(`Geographic scenario ${example.id}: ${JSON.stringify({ state: result.validation, reason: result.message, area: result.plotAreaM2, frontage: result.road?.frontageM, concepts: result.concepts.map((concept) => ({ id: concept.id, gfa: concept.gfaM2, floors: concept.floors.length })) })}`);
       expect(result.zoneEligibility).toBe('inside');
@@ -129,4 +135,46 @@ describe('published geographic scenarios', () => {
       }
     });
   }
+
+  it('stabilizes the original east example across microscopic input changes and rejects invalid serialized output', async () => {
+    const east = context.site.examples!.find(({ id }) => id === 'east')!;
+    const rounded = mapArea(east.parcel, (point) => point.map((value) => Number(value.toFixed(9))));
+    const inputs = [exampleInput(east), exampleInput(east, rounded)];
+    const results = await Promise.all(inputs.map(calculateScenario));
+    expect(results.map(({ validation }) => validation)).toEqual(['valid', 'valid']);
+    expect(Math.abs(results[0].plotAreaM2 - results[1].plotAreaM2)).toBeLessThan(0.002);
+    for (const [index, result] of results.entries()) {
+      expect(result.concepts.map(({ id }) => id)).toEqual(['wide', 'stepped']);
+      expect(result.concepts[1].coveredM2).toBeLessThan(result.concepts[0].coveredM2 * 0.9);
+      for (const concept of result.concepts) {
+        const serialized = JSON.parse(JSON.stringify(concept)) as typeof concept;
+        const audit = await validateGeneratedConcept(inputs[index], serialized);
+        expect(audit.some(({ status }) => status === 'fail')).toBe(false);
+        expect(audit.find(({ id }) => id === 'applicable-envelope')?.status).toBe('pass');
+        const frame = roadFrame(inputs[index].plot, inputs[index].road);
+        await withGeos((scope) => {
+          for (const floor of serialized.floors) {
+            expect(scope.valid(scope.read(floor.geometry))).toBe(true);
+            const native = scope.read(mapArea(floor.geometry, frame.toLocal));
+            expect(scope.valid(native)).toBe(true);
+            expect(scope.area(native)).toBeCloseTo(floor.areaM2, 6);
+          }
+          for (const floor of serialized.envelope ?? []) {
+            expect(scope.valid(scope.read(floor.geometry))).toBe(true);
+            expect(scope.valid(scope.read(mapArea(floor.geometry, frame.toLocal)))).toBe(true);
+          }
+        });
+      }
+    }
+    for (const index of [0, 1]) {
+      expect(Math.abs(results[0].concepts[index].gfaM2 - results[1].concepts[index].gfaM2)).toBeLessThan(0.01);
+    }
+    const [a, b, c, d] = east.parcel.coordinates[0];
+    const invalid = { ...results[0].concepts[0], floors: results[0].concepts[0].floors.map((floor, i) => i === 0
+      ? { ...floor, geometry: { type: 'Polygon' as const, coordinates: [[a, c, b, d, a]] } } : floor) };
+    const audit = await validateGeneratedConcept(inputs[0], invalid);
+    expect(audit.find(({ id }) => id === 'plot')?.status).toBe('fail');
+    expect(audit.find(({ id }) => id === 'applicable-envelope')?.status).toBe('fail');
+    console.log('East stability', JSON.stringify(results.map(result => ({ area: result.plotAreaM2, concepts: result.concepts.map(c => ({ id: c.id, gfa: c.gfaM2, floors: c.floors.length, covered: c.coveredM2 })) }))));
+  });
 });

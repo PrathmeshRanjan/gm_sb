@@ -164,10 +164,20 @@ export async function validateGeneratedConcept(input: ScenarioInput, proposal: C
         'fail', 'scenario', eligibility.message ?? 'This site requires further assessment before automatic validation.')];
     }
     const ctx = prepare(scope, input, plot, eligibility);
+    const invalidGeometry = () => [
+      rule('plot', 'Plot containment and support', 'แนวเขตที่ดิน', 'Independent geometry check', PLAN,
+        'fail', 'scenario', 'A serialized floor or planting polygon is invalid in geographic or projected coordinates.'),
+      rule('applicable-envelope', 'Containment in the applicable floor slices', 'ขอบเขตที่อนุญาต', 'Independent geometry check', '',
+        'fail', 'scenario', 'Invalid serialized geometry cannot be assessed against the applicable slices.'),
+    ];
+    if (!proposal.floors.every((floor) => scope.valid(scope.read(floor.geometry)))
+        || (proposal.planting && !scope.valid(scope.read(proposal.planting)))) return invalidGeometry();
     const floors: NativeFloor[] = proposal.floors.map((floor) => ({
       ...floor, geometry: scope.read(mapArea(floor.geometry, ctx.frame.toLocal)),
     }));
     const planting = proposal.planting && scope.read(mapArea(proposal.planting, ctx.frame.toLocal));
+    if (!floors.every(({ geometry }) => scope.isPolygon(geometry) && scope.valid(geometry))
+        || (planting && !scope.valid(planting))) return invalidGeometry();
     const audit = checkConcept(ctx, floors, planting, proposal.floors.map((floor) => floor.areaM2));
     const siteReason = ctx.conflictsWithRoad ? 'The scenario parcel overlaps the modeled right-of-way.'
       : ctx.unsupportedReason ?? (!ctx.alignmentVerified ? 'The selected alignment does not span the plot.'

@@ -1,5 +1,6 @@
 import type { NativeGeometry } from './geos';
-import { clipRoadSide, worldGeometry } from './context';
+import { clipRoadSide, serializeAreaForAudit } from './context';
+import type { AreaGeometry } from './types';
 import type { Prepared } from './context';
 import { BANGKOK, boundaryDistances, classify, clearance, frontLimits, NATIONAL, PROFILES, rule } from './rules';
 import type { RoadLimit } from './rules';
@@ -97,14 +98,18 @@ export function describeEnvelope(ctx: Prepared, model: ReturnType<typeof floorEn
   classification.push(categories.large ? 'Large building by modeled area' : 'Large building category excluded');
   classification.push(`${kind === 'concept' ? 'Independently measured design GFA' : 'Capacity classification assumption'}: ${categoryGfa.toFixed(2)} m²`);
   const schedule = floors.map(({ floor, baseM, topM, geometry }) => ({ floor, baseM, topM, areaM2: scope.area(geometry) }));
+  const serializedSlices = new Map<NativeGeometry, AreaGeometry>();
   const effect = (active: boolean) => active ? 'Reduces at least one slice.' : 'Does not reduce these slices after other limits.';
   const describeFront = (limit: RoadLimit) => limit
     ? `${limit.distance.toFixed(2)} m from the ${limit.reference === 'centerline' ? 'centerline' : 'near right-of-way edge'}.`
     : 'This setback branch is not triggered at this height and road width.';
   return {
     envelope: floors.flatMap((floor, i) => {
-      const geometry = scope.write(floor.geometry);
-      return geometry ? [{ ...schedule[i], geometry: worldGeometry(ctx, geometry) }] : [];
+      if (schedule[i].areaM2 === 0) return [];
+      const geometry = serializedSlices.get(floor.geometry) ?? scope.temporary(() => serializeAreaForAudit(ctx, floor.geometry)?.world);
+      if (!geometry) throw new Error('Could not serialize a valid applicable envelope.');
+      serializedSlices.set(floor.geometry, geometry);
+      return [{ ...schedule[i], geometry }];
     }),
     explanation: {
       heightM: totalHeightM, classification, floorCount: floors.length, floors: schedule,
