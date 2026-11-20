@@ -8,6 +8,9 @@ import { roadFrame } from '../../src/engine/spatial';
 import { validateGeneratedConcept } from '../../src/engine';
 
 const utm = '+proj=utm +zone=47 +datum=WGS84 +units=m +no_defs';
+// A cold public navigation downloads 4.28 MB of context plus application assets.
+// Keep the actual readiness measurement and allow network variability at startup only.
+const INITIAL_LOAD_TIMEOUT_MS = 20_000;
 const origin = proj4('WGS84', utm, [100.5658, 13.7844]);
 const point = (x: number, y: number) => proj4(utm, 'WGS84', [origin[0] + x, origin[1] + y]);
 
@@ -64,7 +67,7 @@ test('the loaded east example sends saved coordinates and the production worker 
   const context = await readContext();
   const east = context.site.examples!.find(({ id }) => id === 'east')!;
   await page.goto('');
-  await expect(page.getByTestId('result-ready')).toHaveAttribute('data-state', 'valid');
+  await expect(page.getByTestId('result-ready')).toHaveAttribute('data-state', 'valid', { timeout: INITIAL_LOAD_TIMEOUT_MS });
   await page.getByTestId('road-location').selectOption('example:east');
   await page.getByTestId('load-location-example').click();
   await expect(page.getByTestId('result-ready')).toHaveAttribute('data-road-id', '25902874');
@@ -274,7 +277,7 @@ test('public-facing map loads real context and updates a scenario in place', asy
   expect(response?.ok()).toBe(true);
   const currentUrl = page.url();
   const result = page.getByTestId('result-ready');
-  await expect(result).toHaveAttribute('data-state', 'valid');
+  await expect(result).toHaveAttribute('data-state', 'valid', { timeout: INITIAL_LOAD_TIMEOUT_MS });
   await expect(page.getByTestId('site-map').locator('canvas.maplibregl-canvas')).toBeVisible();
   await expect(page.getByTestId('view-plan')).toBeEnabled();
   const graphics = await page.evaluate(() => {
@@ -382,7 +385,7 @@ test('three separated zone locations load the actual facing road, edit in plan, 
   const result = page.getByTestId('result-ready');
   const map = page.getByTestId('site-map');
   const roadSelect = page.getByTestId('road-select');
-  await expect(result).toHaveAttribute('data-state', 'valid');
+  await expect(result).toHaveAttribute('data-state', 'valid', { timeout: INITIAL_LOAD_TIMEOUT_MS });
   const metrics = page.getByTestId('scenario-metrics');
   for (const example of examples) {
     await page.getByRole('tab', { name: 'Scenario' }).click();
@@ -548,7 +551,7 @@ test('rapid edits reject a delayed stale response and recover from a road confli
   });
   await page.goto('');
   const result = page.getByTestId('result-ready');
-  await expect(result).toHaveAttribute('data-state', 'valid');
+  await expect(result).toHaveAttribute('data-state', 'valid', { timeout: INITIAL_LOAD_TIMEOUT_MS });
   const width = page.getByTestId('road-width');
   await width.fill('6');
   await page.waitForFunction(() => (window as Window & { workerResponseProbe?: { held: boolean } }).workerResponseProbe?.held);
@@ -633,7 +636,7 @@ test('rapid location, road, profile and plot updates share one current request',
   await page.goto('');
   const result = page.getByTestId('result-ready');
   const map = page.getByTestId('site-map');
-  await expect(result).toHaveAttribute('data-state', 'valid');
+  await expect(result).toHaveAttribute('data-state', 'valid', { timeout: INITIAL_LOAD_TIMEOUT_MS });
   await page.getByTestId('road-width').fill('6');
   await page.waitForFunction(() => (window as Window & { locationResponseProbe?: { held: boolean } }).locationResponseProbe?.held);
   for (const id of ['southwest', 'north', 'east']) {
